@@ -266,6 +266,14 @@ export type {
   AuthorizationServiceConfig,
 } from './services/authorization-service.js';
 
+// OnchainService (Unified on-chain operations: CTF + Authorization + Swaps)
+export { OnchainService } from './services/onchain-service.js';
+export type {
+  OnchainServiceConfig,
+  ReadyStatus,
+  TokenBalances,
+} from './services/onchain-service.js';
+
 // Price Utilities
 export {
   roundPrice,
@@ -299,7 +307,6 @@ import { WalletService } from './services/wallet-service.js';
 import { MarketService } from './services/market-service.js';
 import { TradingService } from './services/trading-service.js';
 import type { UnifiedMarket, ProcessedOrderbook, ArbitrageOpportunity, KLineInterval, KLineCandle, DualKLineData, PolySDKOptions } from './core/types.js';
-import { PolymarketError, ErrorCode } from './core/errors.js';
 import { createUnifiedCache, type UnifiedCache } from './core/unified-cache.js';
 
 // Re-export for backward compatibility
@@ -369,63 +376,10 @@ export class PolymarketSDK {
 
   /**
    * Get market by slug or condition ID
-   * Uses Gamma for slug, CLOB for conditionId
+   * Delegates to MarketService which handles merging Gamma and CLOB data
    */
   async getMarket(identifier: string): Promise<UnifiedMarket> {
-    const isConditionId =
-      identifier.startsWith('0x') || /^\d+$/.test(identifier);
-
-    if (isConditionId) {
-      return this.getMarketByConditionId(identifier);
-    } else {
-      return this.getMarketBySlug(identifier);
-    }
-  }
-
-  private async getMarketBySlug(slug: string): Promise<UnifiedMarket> {
-    // Gamma as primary source for slug
-    const gammaMarket = await this.gammaApi.getMarketBySlug(slug);
-    if (!gammaMarket) {
-      throw new PolymarketError(
-        ErrorCode.MARKET_NOT_FOUND,
-        `Market not found: ${slug}`
-      );
-    }
-
-    // Enrich with MarketService data
-    try {
-      const clobMarket = await this.markets.getClobMarket(gammaMarket.conditionId);
-      return this.mergeMarkets(gammaMarket, clobMarket);
-    } catch {
-      return this.fromGammaMarket(gammaMarket);
-    }
-  }
-
-  private async getMarketByConditionId(
-    conditionId: string
-  ): Promise<UnifiedMarket> {
-    // MarketService as primary source for conditionId (more reliable)
-    try {
-      const clobMarket = await this.markets.getClobMarket(conditionId);
-
-      // Try to enrich with Gamma data
-      try {
-        const gammaMarket =
-          await this.gammaApi.getMarketByConditionId(conditionId);
-        if (gammaMarket) {
-          return this.mergeMarkets(gammaMarket, clobMarket);
-        }
-      } catch {
-        // Gamma enrichment failed, use CLOB market only
-      }
-
-      return this.fromClobMarket(clobMarket);
-    } catch {
-      throw new PolymarketError(
-        ErrorCode.MARKET_NOT_FOUND,
-        `Market not found: ${conditionId}`
-      );
-    }
+    return this.markets.getMarket(identifier);
   }
 
   // ===== Orderbook Analysis =====
@@ -469,93 +423,6 @@ export class PolymarketSDK {
     }
 
     return null;
-  }
-
-  // ===== Helper Methods =====
-
-  private mergeMarkets(
-    gamma: import('./clients/gamma-api.js').GammaMarket,
-    clob: import('./services/market-service.js').Market
-  ): UnifiedMarket {
-    const yesToken = clob.tokens.find((t: import('./services/market-service.js').MarketToken) => t.outcome === 'Yes');
-    const noToken = clob.tokens.find((t: import('./services/market-service.js').MarketToken) => t.outcome === 'No');
-
-    return {
-      conditionId: clob.conditionId,
-      slug: gamma.slug,
-      question: clob.question,
-      description: clob.description || gamma.description,
-      tokens: {
-        yes: {
-          tokenId: yesToken?.tokenId || '',
-          price: yesToken?.price || gamma.outcomePrices[0] || 0.5,
-        },
-        no: {
-          tokenId: noToken?.tokenId || '',
-          price: noToken?.price || gamma.outcomePrices[1] || 0.5,
-        },
-      },
-      volume: gamma.volume,
-      volume24hr: gamma.volume24hr,
-      liquidity: gamma.liquidity,
-      spread: gamma.spread,
-      active: clob.active,
-      closed: clob.closed,
-      acceptingOrders: clob.acceptingOrders,
-      endDate: clob.endDateIso ? new Date(clob.endDateIso) : new Date(),
-      source: 'merged',
-    };
-  }
-
-  private fromGammaMarket(
-    gamma: import('./clients/gamma-api.js').GammaMarket
-  ): UnifiedMarket {
-    return {
-      conditionId: gamma.conditionId,
-      slug: gamma.slug,
-      question: gamma.question,
-      description: gamma.description,
-      tokens: {
-        yes: { tokenId: '', price: gamma.outcomePrices[0] || 0.5 },
-        no: { tokenId: '', price: gamma.outcomePrices[1] || 0.5 },
-      },
-      volume: gamma.volume,
-      volume24hr: gamma.volume24hr,
-      liquidity: gamma.liquidity,
-      spread: gamma.spread,
-      active: gamma.active,
-      closed: gamma.closed,
-      acceptingOrders: !gamma.closed,
-      endDate: gamma.endDate,
-      source: 'gamma',
-    };
-  }
-
-  private fromClobMarket(
-    clob: import('./services/market-service.js').Market
-  ): UnifiedMarket {
-    const yesToken = clob.tokens.find((t: import('./services/market-service.js').MarketToken) => t.outcome === 'Yes');
-    const noToken = clob.tokens.find((t: import('./services/market-service.js').MarketToken) => t.outcome === 'No');
-
-    return {
-      conditionId: clob.conditionId,
-      slug: clob.marketSlug,
-      question: clob.question,
-      description: clob.description,
-      tokens: {
-        yes: { tokenId: yesToken?.tokenId || '', price: yesToken?.price || 0.5 },
-        no: { tokenId: noToken?.tokenId || '', price: noToken?.price || 0.5 },
-      },
-      volume: 0, // CLOB API doesn't have volume
-      volume24hr: undefined,
-      liquidity: 0,
-      spread: undefined,
-      active: clob.active,
-      closed: clob.closed,
-      acceptingOrders: clob.acceptingOrders,
-      endDate: clob.endDateIso ? new Date(clob.endDateIso) : new Date(),
-      source: 'clob',
-    };
   }
 
   // ===== Cache Management =====
