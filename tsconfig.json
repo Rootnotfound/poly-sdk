@@ -1,8 +1,28 @@
 {
-  "extends": "../tsconfig.base.json",
   "compilerOptions": {
+    // Language and Environment
+    "target": "ES2022",
+    "lib": ["ES2022"],
+
+    // Module System
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+
+    // Emit
     "outDir": "./dist",
-    "rootDir": "."
+    "rootDir": ".",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+
+    // Type Checking
+    "strict": true,
+    "skipLibCheck": true,
+
+    // Interop Constraints
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true
   },
   "include": ["src/**/*", "scripts/dip-arb/**/*"],
   "exclude": ["src/wallets/privy-wallet.ts"]
