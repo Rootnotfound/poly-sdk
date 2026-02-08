@@ -142,53 +142,6 @@ export interface UserTrade {
   makerOrders?: MakerOrderInfo[];
 }
 
-// Activity types
-/**
- * Activity trade from WebSocket
- *
- * 实测验证 (2025-12-28)：proxyWallet 和 name 是顶层字段，不在 trader 对象里
- */
-export interface ActivityTrade {
-  /** Token ID (用于下单) */
-  asset: string;
-  /** Market condition ID */
-  conditionId: string;
-  /** Event slug */
-  eventSlug: string;
-  /** Market slug (可用于过滤) */
-  marketSlug: string;
-  /** Outcome (Yes/No) */
-  outcome: string;
-  /** Trade price */
-  price: number;
-  /** Trade side */
-  side: 'BUY' | 'SELL';
-  /** Trade size in shares */
-  size: number;
-  /** Timestamp (Unix seconds) */
-  timestamp: number;
-  /** Transaction hash */
-  transactionHash: string;
-
-  // ========== 交易者信息 ==========
-
-  /**
-   * Trader info object - 用于 Copy Trading 过滤目标钱包
-   *
-   * 注意: 实测验证 (2025-12-28) 数据结构为:
-   * {
-   *   trader: { name: "username", address: "0x..." }
-   * }
-   * 而非顶层 proxyWallet
-   */
-  trader?: {
-    /** 交易者用户名 */
-    name?: string;
-    /** 交易者钱包地址 - Copy Trading 过滤关键字段！ */
-    address?: string;
-  };
-}
-
 // External price types
 export interface CryptoPrice {
   symbol: string;
@@ -265,11 +218,6 @@ export interface MarketDataHandlers {
 export interface UserDataHandlers {
   onOrder?: (order: UserOrder) => void;
   onTrade?: (trade: UserTrade) => void;
-  onError?: (error: Error) => void;
-}
-
-export interface ActivityHandlers {
-  onTrade?: (trade: ActivityTrade) => void;
   onError?: (error: Error) => void;
 }
 
@@ -802,68 +750,6 @@ export class RealtimeServiceV2 extends EventEmitter {
   }
 
   // ============================================================================
-  // Activity Subscriptions (trades, orders_matched)
-  // ============================================================================
-
-  /**
-   * Subscribe to trading activity for a market or event
-   * @param filter - Event or market slug (optional - if empty, subscribes to all activity)
-   * @param handlers - Event handlers
-   */
-  subscribeActivity(
-    filter: { eventSlug?: string; marketSlug?: string } = {},
-    handlers: ActivityHandlers = {}
-  ): Subscription {
-    const subId = `activity_${++this.subscriptionIdCounter}`;
-
-    // Build filter object with snake_case keys (as expected by the server)
-    // Only include filters if we have actual filter values
-    const hasFilter = filter.eventSlug || filter.marketSlug;
-    const filterObj: Record<string, string> = {};
-    if (filter.eventSlug) filterObj.event_slug = filter.eventSlug;
-    if (filter.marketSlug) filterObj.market_slug = filter.marketSlug;
-
-    // Create subscription objects - only include filters field if we have filters
-    const subscriptions = hasFilter
-      ? [
-          { topic: 'activity', type: 'trades', filters: JSON.stringify(filterObj) },
-          { topic: 'activity', type: 'orders_matched', filters: JSON.stringify(filterObj) },
-        ]
-      : [
-          { topic: 'activity', type: 'trades' },
-          { topic: 'activity', type: 'orders_matched' },
-        ];
-
-    this.sendSubscription({ subscriptions });
-
-    const handler = (trade: ActivityTrade) => handlers.onTrade?.(trade);
-    this.on('activityTrade', handler);
-
-    const subscription: Subscription = {
-      id: subId,
-      topic: 'activity',
-      type: '*',
-      unsubscribe: () => {
-        this.off('activityTrade', handler);
-        this.sendUnsubscription({ subscriptions });
-        this.subscriptions.delete(subId);
-      },
-    };
-
-    this.subscriptions.set(subId, subscription);
-    return subscription;
-  }
-
-  /**
-   * Subscribe to ALL trading activity across all markets (no filtering)
-   * This is useful for Copy Trading - monitoring Smart Money across the platform
-   * @param handlers - Event handlers
-   */
-  subscribeAllActivity(handlers: ActivityHandlers = {}): Subscription {
-    return this.subscribeActivity({}, handlers);
-  }
-
-  // ============================================================================
   // Crypto Price Subscriptions
   // ============================================================================
 
@@ -1316,10 +1202,6 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.handleUserMessage(message.type, payload, message.timestamp);
         break;
 
-      case 'activity':
-        this.handleActivityMessage(message.type, payload, message.timestamp);
-        break;
-
       case 'crypto_prices':
         this.handleCryptoPriceMessage(payload, message.timestamp);
         break;
@@ -1504,26 +1386,6 @@ export class RealtimeServiceV2 extends EventEmitter {
       };
       this.emit('userTrade', trade);
     }
-  }
-
-  private handleActivityMessage(type: string, payload: Record<string, unknown>, timestamp: number): void {
-    const trade: ActivityTrade = {
-      asset: payload.asset as string || '',
-      conditionId: payload.conditionId as string || '',
-      eventSlug: payload.eventSlug as string || '',
-      marketSlug: payload.slug as string || '',
-      outcome: payload.outcome as string || '',
-      price: Number(payload.price) || 0,
-      side: payload.side as 'BUY' | 'SELL',
-      size: Number(payload.size) || 0,
-      timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
-      transactionHash: payload.transactionHash as string || '',
-      trader: {
-        name: payload.name as string | undefined,
-        address: payload.proxyWallet as string | undefined,
-      },
-    };
-    this.emit('activityTrade', trade);
   }
 
   private handleCryptoPriceMessage(payload: Record<string, unknown>, timestamp: number): void {

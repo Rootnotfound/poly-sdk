@@ -134,7 +134,6 @@ export type {
   MarketEvent,
   UserOrder,
   UserTrade,
-  ActivityTrade,
   CryptoPrice,
   EquityPrice,
   Comment,
@@ -145,7 +144,6 @@ export type {
   MarketSubscription,
   MarketDataHandlers,
   UserDataHandlers,
-  ActivityHandlers,
   CryptoPriceHandlers,
   EquityPriceHandlers,
 } from './services/realtime-service-v2.js';
@@ -642,8 +640,8 @@ export class PolymarketSDK {
       this.wallets,
       this.realtime,
       this.tradingService,
-      {},  // default config
-      this.dataApi  // pass dataApi for report generation
+      this.dataApi,  // DataApiClient (required)
+      {}  // default config
     );
 
     // Initialize DipArbService

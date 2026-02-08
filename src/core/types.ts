@@ -163,7 +163,7 @@ export type OrderStatusString =
  * Base trade interface with common fields
  *
  * This is the minimal set of fields that all trade types share.
- * Specific trade types (Trade, TradeInfo, ActivityTrade, ParsedTrade)
+ * Specific trade types (Trade, TradeInfo, ParsedTrade)
  * extend this with source-specific fields.
  */
 export interface BaseTrade {

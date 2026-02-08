@@ -13,7 +13,7 @@
  * ============================================================================
  *
  * ## 监控方式
- * 使用 Activity WebSocket，延迟 < 100ms，实测验证有效。
+ * 使用 Data API /activity 端点轮询，延迟 2-3秒，包含完整市场信息。
  *
  * ## 下单方式
  * | 方式 | 使用场景 | 特点 |
@@ -21,15 +21,18 @@
  * | FOK | 小额跟单 | 全部成交或取消 |
  * | FAK | 大额跟单 | 部分成交也接受 |
  *
- * ## 重要限制
- * ⚠️ Activity WebSocket 不会广播用户自己的交易！
- * 验证跟单结果请使用 TradingService.getTrades()
+ * ## 轮询配置
+ * - 默认间隔：5秒
+ * - 监控 1-10 钱包：3-5秒轮询
+ * - 监控 11-30 钱包：5-10秒轮询
+ * - 监控 31+ 钱包：10-15秒轮询
+ * - Data API 限流：300 req/min
  */
 
 import type { WalletService, TimePeriod, PeriodLeaderboardEntry } from './wallet-service.js';
-import type { RealtimeServiceV2, ActivityTrade } from './realtime-service-v2.js';
+import type { RealtimeServiceV2 } from './realtime-service-v2.js';
 import type { TradingService, OrderResult } from './trading-service.js';
-import type { Position, ClosedPosition, ClosedPositionsParams, DataApiClient } from '../clients/data-api.js';
+import type { Position, ClosedPosition, ClosedPositionsParams, DataApiClient, Activity } from '../clients/data-api.js';
 
 // ============================================================================
 // Market Categorization (exported utilities)
@@ -681,27 +684,32 @@ export class SmartMoneyService {
   private walletService: WalletService;
   private realtimeService: RealtimeServiceV2;
   private tradingService: TradingService;
-  private dataApi: DataApiClient | null;
+  private dataApi: DataApiClient;
   private config: Required<SmartMoneyServiceConfig>;
 
   private smartMoneyCache: Map<string, SmartMoneyWallet> = new Map();
   private smartMoneySet: Set<string> = new Set();
   private cacheTimestamp: number = 0;
 
-  private activeSubscription: { unsubscribe: () => void } | null = null;
+  // 轮询相关
+  private pollIntervalId: NodeJS.Timeout | null = null;
+  private lastCheckTimestamp: number = Math.floor(Date.now() / 1000);
+  private seenTxHashes: Set<string> = new Set();
   private tradeHandlers: Set<(trade: SmartMoneyTrade) => void> = new Set();
+  private targetWallets: string[] = [];
+  private pollInterval: number = 5000; // 默认 5 秒
 
   constructor(
     walletService: WalletService,
     realtimeService: RealtimeServiceV2,
     tradingService: TradingService,
-    config: SmartMoneyServiceConfig = {},
-    dataApi?: DataApiClient
+    dataApi: DataApiClient,
+    config: SmartMoneyServiceConfig = {}
   ) {
     this.walletService = walletService;
     this.realtimeService = realtimeService;
     this.tradingService = tradingService;
-    this.dataApi = dataApi ?? null;
+    this.dataApi = dataApi;
 
     this.config = {
       minPnl: config.minPnl ?? 1000,
@@ -709,12 +717,144 @@ export class SmartMoneyService {
     };
   }
 
+  // ============================================================================
+  // Polling Logic - 轮询逻辑
+  // ============================================================================
+
   /**
-   * Set DataApiClient for report generation
-   * This allows setting the client after construction
+   * Poll target wallets for new activities
+   * @private
    */
-  setDataApiClient(dataApi: DataApiClient): void {
-    this.dataApi = dataApi;
+  private async pollTargetWallets(): Promise<Activity[]> {
+    if (this.targetWallets.length === 0) {
+      return [];
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const start = this.lastCheckTimestamp;
+
+    try {
+      // 并发查询所有目标钱包
+      const results = await Promise.all(
+        this.targetWallets.map(async (wallet) => {
+          try {
+            return await this.dataApi.getActivity(wallet, {
+              type: 'TRADE',
+              start,
+              limit: 100,
+              sortBy: 'TIMESTAMP',
+              sortDirection: 'DESC',
+            });
+          } catch (error) {
+            console.error(`[SmartMoneyService] Failed to fetch activity for ${wallet}:`, error);
+            return [];
+          }
+        })
+      );
+
+      // 更新时间戳
+      this.lastCheckTimestamp = now;
+
+      // 合并结果并按时间排序
+      return results
+        .flat()
+        .sort((a, b) => b.timestamp - a.timestamp);
+    } catch (error) {
+      console.error('[SmartMoneyService] Poll error:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Convert Activity to SmartMoneyTrade
+   * @private
+   */
+  private activityToSmartMoneyTrade(activity: Activity): SmartMoneyTrade | null {
+    const traderAddress = activity.proxyWallet?.toLowerCase();
+    if (!traderAddress) {
+      return null;
+    }
+
+    const isSmartMoney = this.smartMoneySet.has(traderAddress);
+
+    return {
+      traderAddress,
+      traderName: activity.name,
+      conditionId: activity.conditionId,
+      marketSlug: activity.slug,
+      side: activity.side,
+      size: activity.size,
+      price: activity.price,
+      tokenId: activity.asset,
+      outcome: activity.outcome,
+      txHash: activity.transactionHash,
+      timestamp: activity.timestamp,
+      isSmartMoney,
+      smartMoneyInfo: this.smartMoneyCache.get(traderAddress),
+    };
+  }
+
+  /**
+   * Start polling for target wallets
+   * @private
+   */
+  private startPolling(): void {
+    if (this.pollIntervalId) {
+      return; // Already polling
+    }
+
+    // 根据钱包数量调整轮询间隔
+    if (this.targetWallets.length <= 10) {
+      this.pollInterval = 5000; // 5秒
+    } else if (this.targetWallets.length <= 30) {
+      this.pollInterval = 7000; // 7秒
+    } else {
+      this.pollInterval = 10000; // 10秒
+    }
+
+    this.pollIntervalId = setInterval(async () => {
+      const activities = await this.pollTargetWallets();
+
+      for (const activity of activities) {
+        // 去重
+        if (this.seenTxHashes.has(activity.transactionHash)) {
+          continue;
+        }
+        this.seenTxHashes.add(activity.transactionHash);
+
+        // 清理旧的 txHash（保留最近 1000 个）
+        if (this.seenTxHashes.size > 1000) {
+          const toRemove = Array.from(this.seenTxHashes).slice(0, 500);
+          toRemove.forEach(hash => this.seenTxHashes.delete(hash));
+        }
+
+        // 转换为 SmartMoneyTrade
+        const trade = this.activityToSmartMoneyTrade(activity);
+        if (!trade) {
+          continue;
+        }
+
+        // 通知所有 handlers
+        for (const handler of this.tradeHandlers) {
+          try {
+            handler(trade);
+          } catch (error) {
+            console.error('[SmartMoneyService] Handler error:', error);
+          }
+        }
+      }
+    }, this.pollInterval);
+  }
+
+  /**
+   * Stop polling
+   * @private
+   */
+  private stopPolling(): void {
+    if (this.pollIntervalId) {
+      clearInterval(this.pollIntervalId);
+      this.pollIntervalId = null;
+    }
   }
 
   // ============================================================================
@@ -787,6 +927,8 @@ export class SmartMoneyService {
   /**
    * Subscribe to trades from specific addresses
    *
+   * Uses Data API polling (default 5s interval) for real-time trade monitoring.
+   *
    * @example
    * ```typescript
    * const sub = smartMoneyService.subscribeSmartMoneyTrades(
@@ -808,80 +950,58 @@ export class SmartMoneyService {
       smartMoneyOnly?: boolean;
     } = {}
   ): { id: string; unsubscribe: () => void } {
-    this.tradeHandlers.add(onTrade);
+    // 创建过滤后的 handler
+    const filteredHandler = (trade: SmartMoneyTrade) => {
+      // Address filter
+      if (options.filterAddresses && options.filterAddresses.length > 0) {
+        const normalized = options.filterAddresses.map(a => a.toLowerCase());
+        if (!normalized.includes(trade.traderAddress.toLowerCase())) {
+          return;
+        }
+      }
+
+      // Size filter
+      if (options.minSize && trade.size < options.minSize) {
+        return;
+      }
+
+      // Smart Money filter
+      if (options.smartMoneyOnly && !trade.isSmartMoney) {
+        return;
+      }
+
+      onTrade(trade);
+    };
+
+    this.tradeHandlers.add(filteredHandler);
 
     // Ensure cache is populated
     this.getSmartMoneyList().catch(() => {});
 
-    // Start subscription if not active
-    if (!this.activeSubscription) {
-      this.activeSubscription = this.realtimeService.subscribeAllActivity({
-        onTrade: (activityTrade: ActivityTrade) => {
-          this.handleActivityTrade(activityTrade, options);
-        },
-        onError: (error) => {
-          console.error('[SmartMoneyService] Subscription error:', error);
-        },
-      });
+    // 更新目标钱包列表
+    if (options.filterAddresses && options.filterAddresses.length > 0) {
+      const normalized = options.filterAddresses.map(a => a.toLowerCase());
+      this.targetWallets = [...new Set([...this.targetWallets, ...normalized])];
     }
 
+    // 启动轮询
+    this.startPolling();
+
+    const subscriptionId = `smart_money_${Date.now()}`;
+
     return {
-      id: `smart_money_${Date.now()}`,
+      id: subscriptionId,
       unsubscribe: () => {
-        this.tradeHandlers.delete(onTrade);
-        if (this.tradeHandlers.size === 0 && this.activeSubscription) {
-          this.activeSubscription.unsubscribe();
-          this.activeSubscription = null;
+        this.tradeHandlers.delete(filteredHandler);
+
+        // 如果没有 handler 了，停止轮询
+        if (this.tradeHandlers.size === 0) {
+          this.stopPolling();
+          this.targetWallets = [];
+          this.seenTxHashes.clear();
         }
       },
     };
-  }
-
-  private async handleActivityTrade(
-    trade: ActivityTrade,
-    options: { filterAddresses?: string[]; minSize?: number; smartMoneyOnly?: boolean }
-  ): Promise<void> {
-    const rawAddress = trade.trader?.address;
-    if (!rawAddress) return;
-
-    const traderAddress = rawAddress.toLowerCase();
-
-    // Address filter
-    if (options.filterAddresses && options.filterAddresses.length > 0) {
-      const normalized = options.filterAddresses.map(a => a.toLowerCase());
-      if (!normalized.includes(traderAddress)) return;
-    }
-
-    // Size filter
-    if (options.minSize && trade.size < options.minSize) return;
-
-    // Smart Money filter
-    const isSmartMoney = this.smartMoneySet.has(traderAddress);
-    if (options.smartMoneyOnly && !isSmartMoney) return;
-
-    const smartMoneyTrade: SmartMoneyTrade = {
-      traderAddress,
-      traderName: trade.trader?.name,
-      conditionId: trade.conditionId,
-      marketSlug: trade.marketSlug,
-      side: trade.side,
-      size: trade.size,
-      price: trade.price,
-      tokenId: trade.asset,
-      outcome: trade.outcome,
-      txHash: trade.transactionHash,
-      timestamp: trade.timestamp,
-      isSmartMoney,
-      smartMoneyInfo: this.smartMoneyCache.get(traderAddress),
-    };
-
-    for (const handler of this.tradeHandlers) {
-      try {
-        handler(smartMoneyTrade);
-      } catch (error) {
-        console.error('[SmartMoneyService] Handler error:', error);
-      }
-    }
   }
 
   // ============================================================================
@@ -2266,12 +2386,15 @@ export class SmartMoneyService {
   }
 
   disconnect(): void {
-    if (this.activeSubscription) {
-      this.activeSubscription.unsubscribe();
-      this.activeSubscription = null;
-    }
+    // 停止轮询
+    this.stopPolling();
+
+    // 清理状态
     this.tradeHandlers.clear();
+    this.targetWallets = [];
+    this.seenTxHashes.clear();
     this.smartMoneyCache.clear();
     this.smartMoneySet.clear();
+    this.lastCheckTimestamp = Math.floor(Date.now() / 1000);
   }
 }
