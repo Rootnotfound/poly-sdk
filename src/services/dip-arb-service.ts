@@ -303,6 +303,8 @@ export class DipArbService extends EventEmitter {
     this.isRunning = true;
     this.stats = createDipArbInitialStats();
     this.priceHistory = [];  // Clear price history for new market
+    this.upAsks = [];        // Clear stale orderbook data
+    this.downAsks = [];      // Clear stale orderbook data
 
     this.log(`Starting Dip Arb monitor for: ${market.name}`);
     this.log(`Condition ID: ${market.conditionId.slice(0, 20)}...`);
@@ -1707,6 +1709,9 @@ export class DipArbService extends EventEmitter {
     // Stop current monitoring
     await this.stop();
 
+    // Reconnect market WebSocket for clean subscription state
+    await this.realtimeService.reconnectMarketClient();
+
     // Start new market
     await this.start(nextMarket);
 
@@ -1949,6 +1954,12 @@ export class DipArbService extends EventEmitter {
         // Stop current market (this clears the rotate check interval)
         await this.stop();
 
+        // Reconnect market WebSocket for clean subscription state.
+        // The Polymarket WS server binds token subscriptions to a connection;
+        // sending { type: "MARKET" } with different tokens on the same connection
+        // does not replace the subscription. A fresh connection is required.
+        await this.realtimeService.reconnectMarketClient();
+
         // Start new market
         await this.start(newMarket);
 
@@ -1971,6 +1982,9 @@ export class DipArbService extends EventEmitter {
 
           // Stop current market (this clears the rotate check interval)
           await this.stop();
+
+          // Reconnect market WebSocket for clean subscription state
+          await this.realtimeService.reconnectMarketClient();
 
           // Start new market
           await this.start(newMarket);

@@ -475,6 +475,78 @@ export class RealtimeServiceV2 extends EventEmitter {
     this.userCredentials = null;
   }
 
+  /**
+   * Reconnect just the market WebSocket client.
+   *
+   * The Polymarket WS server binds token subscriptions to a connection.
+   * Sending a second { type: "MARKET" } with different tokens on the same
+   * connection does NOT replace the subscription. The only reliable way to
+   * subscribe to new tokens is to open a fresh WebSocket connection.
+   *
+   * This method disconnects only the market client, clears market-related
+   * state, creates a new client, and connects it. User and crypto channels
+   * are left untouched.
+   */
+  async reconnectMarketClient(): Promise<void> {
+    this.log('Reconnecting market WebSocket client...');
+
+    // Cancel pending timers related to market subscriptions
+    this.cancelSubscriptionRefresh();
+    this.cancelMarketSubscriptionBatch();
+
+    // Disconnect the existing market client
+    if (this.client) {
+      this.client.disconnect();
+      this.client = null;
+      this.connected = false;
+    }
+
+    // Clear market-related subscription state
+    this.accumulatedMarketTokenIds.clear();
+    this.subscriptionMessages.delete('__merged_market__');
+    this.subscriptionGenerations.delete('__merged_market__');
+
+    // Remove market subscriptions from the subscriptions map
+    // (keep user/crypto/other subscriptions)
+    const marketSubIds: string[] = [];
+    this.subscriptions.forEach((sub, subId) => {
+      if (sub.topic === 'clob_market') {
+        marketSubIds.push(subId);
+      }
+    });
+    marketSubIds.forEach(subId => this.subscriptions.delete(subId));
+
+    // Create a new market client
+    const connectPromise = new Promise<void>((resolve) => {
+      this.connectResolve = resolve;
+    });
+
+    this.client = new RealTimeDataClient({
+      onConnect: this.handleConnect.bind(this),
+      onMessage: this.handleMessage.bind(this),
+      onStatusChange: this.handleStatusChange.bind(this),
+      autoReconnect: this.config.autoReconnect,
+      pingInterval: this.config.pingInterval,
+      debug: this.config.debug,
+    });
+
+    this.client.connect();
+
+    // Wait for connection with timeout
+    const timeout = 10_000;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error('Market WebSocket reconnection timeout (10s)')), timeout);
+    });
+
+    try {
+      await Promise.race([connectPromise, timeoutPromise]);
+      this.log('Market WebSocket client reconnected successfully');
+    } catch (error) {
+      this.log(`Market WebSocket reconnection failed: ${error}`);
+      throw error;
+    }
+  }
+
   private cancelMarketSubscriptionBatch(): void {
     if (this.marketSubscriptionBatchTimer) {
       clearTimeout(this.marketSubscriptionBatchTimer);

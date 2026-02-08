@@ -61,7 +61,7 @@ function parseArgs(): CliArgs {
     XRP: { dipThreshold: 0.40, slidingWindowMs: 3000, leg2TimeoutSeconds: 60, sumTarget: 0.85 },
     SOL: { dipThreshold: 0.40, slidingWindowMs: 3000, leg2TimeoutSeconds: 60, sumTarget: 0.85 },
     ETH: { dipThreshold: 0.30, slidingWindowMs: 5000, leg2TimeoutSeconds: 60, sumTarget: 0.93 },
-    BTC: { dipThreshold: 0.20, slidingWindowMs: 5000, leg2TimeoutSeconds: 60, sumTarget: 0.95 },
+    BTC: { dipThreshold: 0.40, slidingWindowMs: 5000, leg2TimeoutSeconds: 60, sumTarget: 0.95 },
   };
 
   const defaults = coinDefaults[coin];
