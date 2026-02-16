@@ -92,6 +92,12 @@ export interface TradingServiceConfig {
   chainId?: number;
   /** Pre-generated API credentials (optional) */
   credentials?: ApiCredentials;
+  /** Builder API credentials (optional) - enables Builder mode with fee sharing and rewards */
+  builderCreds?: {
+    key: string;
+    secret: string;
+    passphrase: string;
+  };
 }
 
 // Order types
@@ -337,7 +343,20 @@ export class TradingService {
       };
     }
 
-    // Re-initialize with L2 auth (credentials)
+    // Construct BuilderConfig if builderCreds are provided
+    let builderConfig: any = undefined;
+    if (this.config.builderCreds) {
+      const { BuilderConfig } = await import('@polymarket/builder-signing-sdk');
+      builderConfig = new BuilderConfig({
+        localBuilderCreds: {
+          key: this.config.builderCreds.key,
+          secret: this.config.builderCreds.secret,
+          passphrase: this.config.builderCreds.passphrase,
+        },
+      });
+    }
+
+    // Re-initialize with L2 auth (credentials) and optional BuilderConfig
     this.clobClient = new ClobClient(
       CLOB_HOST,
       this.chainId,
@@ -346,7 +365,12 @@ export class TradingService {
         key: this.credentials.key,
         secret: this.credentials.secret,
         passphrase: this.credentials.passphrase,
-      }
+      },
+      undefined, // signatureType (use default)
+      undefined, // funderAddress (not used)
+      undefined, // geoBlockToken (not used)
+      undefined, // useServerTime (use default)
+      builderConfig, // BuilderConfig (arg 9)
     );
 
     this.initialized = true;

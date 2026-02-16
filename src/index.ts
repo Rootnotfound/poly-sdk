@@ -398,6 +398,14 @@ export type {
   TopRewardMarket,
 } from './services/trading-service.js';
 
+// RelayerService - Gasless on-chain operations via Polymarket Builder Relayer
+export { RelayerService, RelayerState } from './services/relayer-service.js';
+export type {
+  RelayerServiceConfig,
+  RelayerResult,
+  SafeDeployResult,
+} from './services/relayer-service.js';
+
 // CTFManager - CTF operations + event monitoring (Recommended)
 export { CTFManager } from './services/ctf-manager.js';
 export type {

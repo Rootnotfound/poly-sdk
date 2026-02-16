@@ -210,6 +210,8 @@ export interface OrderManagerConfig {
   pollingInterval?: number;
   /** RPC URL for Polygon provider (for settlement tracking) */
   polygonRpcUrl?: string;
+  /** Builder API credentials (for gasless operations and fee sharing) */
+  builderCreds?: { key: string; secret: string; passphrase: string };
 }
 
 /**
@@ -673,7 +675,7 @@ export class OrderManager extends EventEmitter {
   private polygonProvider: ethers.providers.Provider | null = null;
 
   // ========== Configuration ==========
-  private config: Required<OrderManagerConfig>;
+  private config: Required<Omit<OrderManagerConfig, 'builderCreds'>> & Pick<OrderManagerConfig, 'builderCreds'>;
   private initialized = false;
 
   // ========== Monitoring State ==========
@@ -711,6 +713,7 @@ export class OrderManager extends EventEmitter {
       {
         privateKey: config.privateKey,
         chainId: this.config.chainId,
+        builderCreds: config.builderCreds,
       }
     );
   }

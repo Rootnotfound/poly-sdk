@@ -484,7 +484,12 @@ export class GammaApiClient {
    */
   async getMarketByConditionId(conditionId: string): Promise<GammaMarket | null> {
     const markets = await this.getMarkets({ conditionId, limit: 1 });
-    return markets[0] || null;
+    const market = markets[0] || null;
+    // Guard: Gamma API may silently ignore condition_id filter and return wrong market
+    if (market && market.conditionId !== conditionId) {
+      return null;
+    }
+    return market;
   }
 
   // ===== Event Queries =====

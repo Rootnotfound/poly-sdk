@@ -86,8 +86,8 @@ export function mapApiStatusToInternal(apiOrder: OpenOrder): OrderStatus {
     return OrderStatus.PENDING;
   }
 
-  // Handle terminal states
-  if (apiStatus === 'cancelled') {
+  // Handle terminal states (support both British 'cancelled' and American 'canceled')
+  if (apiStatus === 'cancelled' || apiStatus === 'canceled') {
     return OrderStatus.CANCELLED;
   }
 
