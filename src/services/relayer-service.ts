@@ -86,6 +86,10 @@ const ERC20_ABI = [
   'function approve(address spender, uint256 amount) returns (bool)',
 ];
 
+const ERC1155_ABI = [
+  'function setApprovalForAll(address operator, bool approved) external',
+];
+
 // ============================================================================
 // RelayerService Implementation
 // ============================================================================
@@ -241,6 +245,45 @@ export class RelayerService {
         return {
           success: false,
           errorMessage: `USDC approval failed: ${tx?.state || 'No transaction'}`,
+        };
+      }
+
+      return {
+        success: true,
+        txHash: tx.transactionHash,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        errorMessage: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  }
+
+  /**
+   * Approve ERC1155 (Conditional Tokens) operator via Relayer (gasless)
+   *
+   * Required for order fills — CTF Exchange needs setApprovalForAll to transfer tokens.
+   *
+   * @param operator - Operator address (e.g., CTF_EXCHANGE, NEG_RISK_CTF_EXCHANGE)
+   */
+  async approveERC1155ForAll(operator: string): Promise<RelayerResult> {
+    const erc1155Interface = new ethers.utils.Interface(ERC1155_ABI);
+    const data = erc1155Interface.encodeFunctionData('setApprovalForAll', [operator, true]);
+
+    try {
+      const response = await this.relayClient.execute([{
+        to: CTF_CONTRACT,
+        value: '0',
+        data,
+      }]);
+
+      const tx = await response.wait();
+
+      if (!tx || tx.state === RelayerState.FAILED) {
+        return {
+          success: false,
+          errorMessage: `ERC1155 approval failed: ${tx?.state || 'No transaction'}`,
         };
       }
 

@@ -27,6 +27,10 @@ import {
   type TickSize,
 } from '@polymarket/clob-client';
 
+// SignatureType from @polymarket/order-utils (transitive dep, not directly importable)
+// Values: EOA = 0, POLY_PROXY = 1, POLY_GNOSIS_SAFE = 2
+const SIGNATURE_TYPE_POLY_GNOSIS_SAFE = 2;
+
 import { Wallet } from 'ethers';
 import { RateLimiter, ApiType } from '../core/rate-limiter.js';
 import type { UnifiedCache } from '../core/unified-cache.js';
@@ -98,6 +102,8 @@ export interface TradingServiceConfig {
     secret: string;
     passphrase: string;
   };
+  /** Gnosis Safe address — required for Builder mode so orders use Safe as maker/funder */
+  safeAddress?: string;
 }
 
 // Order types
@@ -154,6 +160,9 @@ export interface Order {
    * undefined for GTC orders
    */
   expiration?: number;
+
+  /** Maker address (EOA or Safe) — from CLOB's maker_address field */
+  makerAddress?: string;
 }
 
 export interface OrderResult {
@@ -356,6 +365,9 @@ export class TradingService {
       });
     }
 
+    // Builder mode: orders use Safe as maker, signed by EOA owner
+    const isBuilderMode = !!this.config.builderCreds && !!this.config.safeAddress;
+
     // Re-initialize with L2 auth (credentials) and optional BuilderConfig
     this.clobClient = new ClobClient(
       CLOB_HOST,
@@ -366,10 +378,10 @@ export class TradingService {
         secret: this.credentials.secret,
         passphrase: this.credentials.passphrase,
       },
-      undefined, // signatureType (use default)
-      undefined, // funderAddress (not used)
-      undefined, // geoBlockToken (not used)
-      undefined, // useServerTime (use default)
+      isBuilderMode ? SIGNATURE_TYPE_POLY_GNOSIS_SAFE : undefined, // signatureType
+      isBuilderMode ? this.config.safeAddress : undefined,         // funderAddress (Safe holds the tokens)
+      undefined, // geoBlockToken
+      undefined, // useServerTime
       builderConfig, // BuilderConfig (arg 9)
     );
 
@@ -750,6 +762,7 @@ export class TradingService {
           createdAt: order.created_at,
           updatedAt: Date.now(),
           expiration: order.expiration ? Number(order.expiration) : undefined,
+          makerAddress: (order as any).maker_address || undefined,
         };
       } catch (error) {
         // If order not found, return null instead of throwing

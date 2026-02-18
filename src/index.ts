@@ -459,6 +459,7 @@ export {
   NATIVE_USDC_CONTRACT,    // Native USDC (0x3c49...) - NOT for CTF
   NEG_RISK_CTF_EXCHANGE,
   NEG_RISK_ADAPTER,
+  CTF_EXCHANGE,
   USDC_DECIMALS,
   calculateConditionId,
   parseUsdc,

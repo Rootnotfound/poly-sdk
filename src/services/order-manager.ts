@@ -212,6 +212,8 @@ export interface OrderManagerConfig {
   polygonRpcUrl?: string;
   /** Builder API credentials (for gasless operations and fee sharing) */
   builderCreds?: { key: string; secret: string; passphrase: string };
+  /** Gnosis Safe address — required for Builder mode so orders use Safe as maker */
+  safeAddress?: string;
 }
 
 /**
@@ -675,7 +677,7 @@ export class OrderManager extends EventEmitter {
   private polygonProvider: ethers.providers.Provider | null = null;
 
   // ========== Configuration ==========
-  private config: Required<Omit<OrderManagerConfig, 'builderCreds'>> & Pick<OrderManagerConfig, 'builderCreds'>;
+  private config: Required<Omit<OrderManagerConfig, 'builderCreds' | 'safeAddress'>> & Pick<OrderManagerConfig, 'builderCreds' | 'safeAddress'>;
   private initialized = false;
 
   // ========== Monitoring State ==========
@@ -714,6 +716,7 @@ export class OrderManager extends EventEmitter {
         privateKey: config.privateKey,
         chainId: this.config.chainId,
         builderCreds: config.builderCreds,
+        safeAddress: config.safeAddress,
       }
     );
   }
@@ -1377,9 +1380,11 @@ export class OrderManager extends EventEmitter {
 
     // Deduplicate events
     // When we're maker, include our orderId in the key to handle multiple makers in same trade
+    // NOTE: Do NOT include userTrade.status in the key — same fill transitions through
+    // MATCHED → MINED → CONFIRMED, and including status creates different keys for the same fill
     const eventKey = makerInfo
-      ? `trade_${userTrade.tradeId}_${userTrade.status}_${watched.orderId}`
-      : `trade_${userTrade.tradeId}_${userTrade.status}_${userTrade.timestamp}`;
+      ? `trade_${userTrade.tradeId}_${watched.orderId}`
+      : `trade_${userTrade.tradeId}_${userTrade.timestamp}`;
     if (this.processedEvents.has(eventKey)) return;
     this.processedEvents.add(eventKey);
 
