@@ -61,7 +61,7 @@ function parseArgs(): CliArgs {
     XRP: { dipThreshold: 0.40, slidingWindowMs: 3000, leg2TimeoutSeconds: 60, sumTarget: 0.85 },
     SOL: { dipThreshold: 0.40, slidingWindowMs: 3000, leg2TimeoutSeconds: 60, sumTarget: 0.85 },
     ETH: { dipThreshold: 0.30, slidingWindowMs: 5000, leg2TimeoutSeconds: 60, sumTarget: 0.93 },
-    BTC: { dipThreshold: 0.40, slidingWindowMs: 5000, leg2TimeoutSeconds: 60, sumTarget: 0.95 },
+    BTC: { dipThreshold: 0.20, slidingWindowMs: 3000, leg2TimeoutSeconds: 60, sumTarget: 0.95 },
   };
 
   const defaults = coinDefaults[coin];
@@ -72,7 +72,7 @@ function parseArgs(): CliArgs {
     slidingWindowMs: getArgValue('window', defaults.slidingWindowMs!),
     leg2TimeoutSeconds: getArgValue('timeout', defaults.leg2TimeoutSeconds!),
     sumTarget: getArgValue('target', defaults.sumTarget!),
-    shares: getArgValue('shares', 25),
+    shares: getArgValue('shares', 5),
   };
 }
 
@@ -81,7 +81,6 @@ const SELECTED_COIN = CLI_ARGS.coin;
 
 // Config
 const PRIVATE_KEY = process.env.PRIVATE_KEY || '';
-const MONITOR_DURATION_MS = 60 * 60 * 1000; // 1 hour
 const LOG_DIR = '/tmp/dip-arb-logs';
 
 if (!PRIVATE_KEY) {
@@ -166,7 +165,7 @@ async function main() {
     // 信号检测参数 (支持命令行覆盖)
     slidingWindowMs: CLI_ARGS.slidingWindowMs,  // --window=10000 (毫秒)
     dipThreshold: CLI_ARGS.dipThreshold,        // --dip=0.30 (30%)
-    windowMinutes: 14,       // 轮次开始后 14 分钟内可交易
+    windowMinutes: 3,       // 轮次开始后 14 分钟内可交易
 
     // 执行参数
     maxSlippage: 0.02,       // 2% 滑点
@@ -209,6 +208,7 @@ async function main() {
   log('Initializing SDK...');
   const sdk = new PolymarketSDK({
     privateKey: PRIVATE_KEY,
+    rpcUrl: process.env.RPC_URL || 'https://polygon-mainnet.g.alchemy.com/v2/IVqi8CHXQ1P4K8SLjC1m4',
   });
 
   sdk.dipArb.updateConfig(config);
@@ -400,40 +400,57 @@ async function main() {
     }
   }, 30000);
 
-  // Wait
-  await new Promise(resolve => setTimeout(resolve, MONITOR_DURATION_MS));
+  // ========================================
+  // Graceful Shutdown
+  // ========================================
 
-  // Cleanup
-  clearInterval(statusInterval);
+  const shutdown = async (reason: string) => {
+    log('');
+    log(`Shutting down (${reason})...`);
 
-  // Final stats
-  const stats = sdk.dipArb.getStats();
+    clearInterval(statusInterval);
+
+    // Final stats
+    const stats = sdk.dipArb.getStats();
+    log('');
+    log('╔══════════════════════════════════════════════════════════╗');
+    log('║                     FINAL STATS                          ║');
+    log('╠══════════════════════════════════════════════════════════╣');
+    log(`║ Running Time:     ${Math.round(stats.runningTimeMs / 1000)}s`);
+    log(`║ Rounds Monitored: ${stats.roundsMonitored}`);
+    log(`║ Signals Detected: ${stats.signalsDetected}`);
+    log(`║ Leg1 Filled:      ${stats.leg1Filled}`);
+    log(`║ Leg2 Filled:      ${stats.leg2Filled}`);
+    log(`║ Total Profit:     $${stats.totalProfit.toFixed(2)}`);
+    log('╚══════════════════════════════════════════════════════════╝');
+
+    await sdk.dipArb.stop();
+    sdk.stop();
+
+    saveCurrentLog(reason === 'interrupted' ? 'interrupted' : 'final');
+    process.exit(0);
+  };
+
+  // Listen for "stop auto-trade service" typed in terminal
+  process.stdin.setEncoding('utf8');
+  process.stdin.resume();
+  process.stdin.on('data', (data: string) => {
+    const input = data.trim().toLowerCase();
+    if (input === 'stop auto-trade service' || input === 'stop') {
+      shutdown('user-stop');
+    }
+  });
+
+  // Handle Ctrl+C
+  process.on('SIGINT', () => shutdown('interrupted'));
+  process.on('SIGTERM', () => shutdown('terminated'));
+
+  log('Type "stop" or "stop auto-trade service" to gracefully shut down.');
   log('');
-  log('╔══════════════════════════════════════════════════════════╗');
-  log('║                     FINAL STATS                          ║');
-  log('╠══════════════════════════════════════════════════════════╣');
-  log(`║ Running Time:     ${Math.round(stats.runningTimeMs / 1000)}s`);
-  log(`║ Rounds Monitored: ${stats.roundsMonitored}`);
-  log(`║ Signals Detected: ${stats.signalsDetected}`);
-  log(`║ Leg1 Filled:      ${stats.leg1Filled}`);
-  log(`║ Leg2 Filled:      ${stats.leg2Filled}`);
-  log(`║ Total Profit:     $${stats.totalProfit.toFixed(2)}`);
-  log('╚══════════════════════════════════════════════════════════╝');
 
-  await sdk.dipArb.stop();
-  sdk.stop();
-
-  // Save final log
-  saveCurrentLog('final');
+  // Run forever until stopped
+  await new Promise(() => {});
 }
-
-// Handle Ctrl+C
-process.on('SIGINT', async () => {
-  log('');
-  log('Interrupted. Saving logs...');
-  saveCurrentLog('interrupted');
-  process.exit(0);
-});
 
 main().catch((err) => {
   log(`Fatal error: ${err.message}`);

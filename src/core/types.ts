@@ -258,6 +258,13 @@ export interface PolySDKOptions {
     secret: string;
     passphrase: string;
   };
+
+  /**
+   * Polygon RPC URL for on-chain operations (merge, redeem, balance queries).
+   * Defaults to public https://polygon-rpc.com if not provided.
+   * Recommend using a private RPC (e.g. Alchemy, Infura) for reliability.
+   */
+  rpcUrl?: string;
 }
 
 // K-Line interval types

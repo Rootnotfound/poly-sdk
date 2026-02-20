@@ -652,7 +652,8 @@ export class PolymarketSDK {
       this.tradingService,
       this.markets,
       config.privateKey,
-      config.chainId
+      config.chainId,
+      config.rpcUrl
     );
   }
 

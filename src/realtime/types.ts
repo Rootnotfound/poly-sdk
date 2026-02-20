@@ -513,6 +513,12 @@ export interface RealTimeDataClientConfig {
   maxReconnectAttempts?: number;
   /** Pong timeout in ms - disconnect if no pong received (default: 10000) */
   pongTimeout?: number;
+  /**
+   * Ping mode: 'protocol' uses RFC 6455 ping/pong frames (for CLOB endpoints),
+   * 'text' sends string "ping" messages (for live data endpoint per Polymarket's real-time-data-client).
+   * Default: 'protocol'
+   */
+  pingMode?: 'protocol' | 'text';
   /** Enable debug logging */
   debug?: boolean;
 }
@@ -543,6 +549,10 @@ export interface RealTimeDataClientInterface {
   subscribeCryptoChainlinkPrices(symbols: string[]): void;
   /** Unsubscribe from Chainlink crypto prices */
   unsubscribeCryptoChainlinkPrices(symbols: string[]): void;
+  /** Subscribe to activity feed (trades / orders_matched) on the live data endpoint */
+  subscribeActivity(filter?: { event_slug?: string; market_slug?: string }): void;
+  /** Unsubscribe from activity feed */
+  unsubscribeActivity(filter?: { event_slug?: string; market_slug?: string }): void;
   /** Check if connected */
   isConnected(): boolean;
   /** Get current connection status */

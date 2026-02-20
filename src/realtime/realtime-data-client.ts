@@ -71,6 +71,7 @@ export class RealTimeDataClient implements RealTimeDataClientInterface {
       reconnectDelay: config.reconnectDelay ?? DEFAULT_RECONNECT_DELAY,
       maxReconnectAttempts: config.maxReconnectAttempts ?? DEFAULT_MAX_RECONNECT_ATTEMPTS,
       pongTimeout: config.pongTimeout ?? DEFAULT_PONG_TIMEOUT,
+      pingMode: config.pingMode ?? 'protocol',
       debug: config.debug ?? false,
       onConnect: config.onConnect,
       onMessage: config.onMessage,
@@ -428,6 +429,44 @@ export class RealTimeDataClient implements RealTimeDataClientInterface {
   }
 
   /**
+   * Subscribe to activity feed (trades / orders_matched)
+   *
+   * The activity feed is served by the LIVE_DATA endpoint (`wss://ws-live-data.polymarket.com`),
+   * NOT the CLOB market endpoint. It uses the real-time-data-client subscription format.
+   *
+   * @param filter - Optional filter by event_slug or market_slug
+   * @see https://github.com/Polymarket/real-time-data-client
+   */
+  subscribeActivity(filter?: { event_slug?: string; market_slug?: string }): void {
+    const hasFilter = filter && (filter.event_slug || filter.market_slug);
+    const filterStr = hasFilter ? JSON.stringify(filter) : undefined;
+
+    const subscriptions: Array<{ topic: string; type: string; filters?: string }> = [
+      { topic: 'activity', type: 'trades', ...(filterStr && { filters: filterStr }) },
+      { topic: 'activity', type: 'orders_matched', ...(filterStr && { filters: filterStr }) },
+    ];
+
+    const msg = { action: 'subscribe', subscriptions };
+    this.send(JSON.stringify(msg));
+  }
+
+  /**
+   * Unsubscribe from activity feed
+   */
+  unsubscribeActivity(filter?: { event_slug?: string; market_slug?: string }): void {
+    const hasFilter = filter && (filter.event_slug || filter.market_slug);
+    const filterStr = hasFilter ? JSON.stringify(filter) : undefined;
+
+    const subscriptions: Array<{ topic: string; type: string; filters?: string }> = [
+      { topic: 'activity', type: 'trades', ...(filterStr && { filters: filterStr }) },
+      { topic: 'activity', type: 'orders_matched', ...(filterStr && { filters: filterStr }) },
+    ];
+
+    const msg = { action: 'unsubscribe', subscriptions };
+    this.send(JSON.stringify(msg));
+  }
+
+  /**
    * Check if connected
    */
   isConnected(): boolean {
@@ -466,6 +505,15 @@ export class RealTimeDataClient implements RealTimeDataClientInterface {
   private handleMessage(data: WebSocket.RawData): void {
     try {
       const raw = data.toString();
+
+      // Handle text "pong" response from the live data endpoint
+      if (raw === 'pong' || raw === '"pong"') {
+        this.log('Received text pong');
+        this.pongReceived = true;
+        this.clearPongTimeout();
+        return;
+      }
+
       this.log(`Raw message: ${raw.slice(0, 200)}${raw.length > 200 ? '...' : ''}`);
       const parsed = JSON.parse(raw);
 
@@ -654,6 +702,18 @@ export class RealTimeDataClient implements RealTimeDataClientInterface {
       // @see https://docs.polymarket.com/developers/RTDS/RTDS-crypto-prices
       // ----------------------------------------------------------------------
 
+      // activity: Trade and order matched events from the live data endpoint
+      if (obj.topic === 'activity') {
+        const payload = obj.payload as Record<string, unknown>;
+        messages.push({
+          topic: 'activity',
+          type: (obj.type as string) || 'trades',
+          timestamp: this.normalizeTimestamp(payload?.timestamp) || timestamp,
+          payload: payload || obj,
+        });
+        return messages;
+      }
+
       // crypto_prices or crypto_prices_chainlink: Real-time price updates
       if (obj.topic === 'crypto_prices' || obj.topic === 'crypto_prices_chainlink') {
         const payload = obj.payload as Record<string, unknown>;
@@ -747,8 +807,15 @@ export class RealTimeDataClient implements RealTimeDataClientInterface {
       }
 
       this.pongReceived = false;
-      this.ws.ping();
-      this.log('Sent ping');
+
+      if (this.config.pingMode === 'text') {
+        // Live data endpoint expects text "ping" (per @polymarket/real-time-data-client)
+        this.ws.send('ping');
+        this.log('Sent text ping');
+      } else {
+        this.ws.ping();
+        this.log('Sent ping');
+      }
 
       // Set timeout for pong response
       this.setPongTimeout();

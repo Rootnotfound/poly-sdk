@@ -132,7 +132,8 @@ export class DipArbService extends EventEmitter {
     tradingService: TradingService | null,
     marketService: MarketService,
     privateKey?: string,
-    chainId: number = 137
+    chainId: number = 137,
+    rpcUrl?: string
   ) {
     super();
 
@@ -149,7 +150,7 @@ export class DipArbService extends EventEmitter {
     if (privateKey) {
       this.ctf = new CTFClient({
         privateKey,
-        rpcUrl: 'https://polygon-rpc.com',
+        rpcUrl: rpcUrl || 'https://polygon-rpc.com',
         chainId,
       });
     }
@@ -580,6 +581,10 @@ export class DipArbService extends EventEmitter {
 
       // 至少有一笔成功
       if (totalSharesFilled > 0) {
+        // ✅ FIX: Verify actual fill via on-chain balance check.
+        // Market orders may receive fewer shares than expected due to slippage.
+        totalSharesFilled = await this.verifyPostTradeBalance(signal.dipSide, totalSharesFilled);
+
         const avgPrice = totalAmountSpent / totalSharesFilled;
 
         // Record leg1 fill
@@ -710,6 +715,10 @@ export class DipArbService extends EventEmitter {
 
       // 至少有一笔成功
       if (totalSharesFilled > 0) {
+        // ✅ FIX: Verify actual fill via on-chain balance check.
+        // Market orders may receive fewer shares than expected due to slippage.
+        totalSharesFilled = await this.verifyPostTradeBalance(signal.hedgeSide, totalSharesFilled);
+
         const avgPrice = totalAmountSpent / totalSharesFilled;
         const leg1Price = this.currentRound.leg1?.price || 0;
         const actualTotalCost = leg1Price + avgPrice;
@@ -822,60 +831,146 @@ export class DipArbService extends EventEmitter {
       };
     }
 
-    // Merge the minimum of Leg1 and Leg2 shares (should be equal after our fix)
-    const shares = Math.min(
+    // Use mergeByTokenIds with Polymarket token IDs
+    const tokenIds = {
+      yesTokenId: this.market.upTokenId,
+      noTokenId: this.market.downTokenId,
+    };
+
+    // ✅ FIX: Wait for on-chain settlement before merging.
+    // Polymarket CLOB fills orders off-chain, then settles on Polygon asynchronously.
+    // The CLOB API returns success immediately, but tokens don't appear in the wallet
+    // for 10-30+ seconds. We must poll until the on-chain balance reflects the fills.
+    const recordedShares = Math.min(
       this.currentRound.leg1?.shares || 0,
       this.currentRound.leg2?.shares || 0
     );
+    const SETTLEMENT_POLL_INTERVAL_MS = 5000;  // 5 seconds between polls
+    const SETTLEMENT_MAX_WAIT_MS = 120000;     // 2 minutes max wait
+    const settlementStart = Date.now();
 
-    if (shares <= 0) {
-      return {
-        success: false,
-        leg: 'merge',
-        roundId,
-        error: 'No shares to merge',
-        executionTimeMs: Date.now() - startTime,
-      };
-    }
+    let shares = 0;
+    let settlementAttempt = 0;
 
-    try {
-      // Use mergeByTokenIds with Polymarket token IDs
-      const tokenIds = {
-        yesTokenId: this.market.upTokenId,
-        noTokenId: this.market.downTokenId,
-      };
+    while (Date.now() - settlementStart < SETTLEMENT_MAX_WAIT_MS) {
+      settlementAttempt++;
 
-      this.log(`🔄 Merging ${shares.toFixed(1)} UP + DOWN → USDC.e...`);
+      try {
+        const balances = await this.ctf.getPositionBalanceByTokenIds(
+          this.market.conditionId,
+          tokenIds
+        );
+        const upBalance = parseFloat(balances.yesBalance);
+        const downBalance = parseFloat(balances.noBalance);
+        shares = Math.min(upBalance, downBalance);
 
-      const result = await this.ctf.mergeByTokenIds(
-        this.market.conditionId,
-        tokenIds,
-        shares.toString()
-      );
+        if (shares > 0.01) {
+          // On-chain balance is available — settlement complete
+          if (Math.abs(shares - recordedShares) > 0.01) {
+            this.log(`⚠️ Merge shares adjusted: recorded=${recordedShares.toFixed(2)}, on-chain=${shares.toFixed(2)} (UP=${upBalance.toFixed(2)}, DOWN=${downBalance.toFixed(2)})`);
+          }
+          break;
+        }
 
-      if (result.success) {
-        this.log(`✅ Merge successful: ${shares.toFixed(1)} pairs → $${result.usdcReceived || shares.toFixed(2)} USDC.e`);
-        this.log(`   TxHash: ${result.txHash?.slice(0, 20)}...`);
+        // Balance is 0 — settlement likely pending
+        const elapsed = Math.round((Date.now() - settlementStart) / 1000);
+        this.log(`⏳ Waiting for on-chain settlement... (attempt ${settlementAttempt}, ${elapsed}s elapsed, UP=${upBalance.toFixed(2)}, DOWN=${downBalance.toFixed(2)})`);
+
+      } catch (balanceError) {
+        this.log(`⚠️ Balance query failed (attempt ${settlementAttempt}): ${balanceError instanceof Error ? balanceError.message : String(balanceError)}`);
       }
 
-      return {
-        success: result.success,
-        leg: 'merge',
-        roundId,
-        shares,
-        txHash: result.txHash,
-        executionTimeMs: Date.now() - startTime,
-      };
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      this.log(`❌ Merge failed: ${errorMsg}`);
-      return {
-        success: false,
-        leg: 'merge',
-        roundId,
-        error: errorMsg,
-        executionTimeMs: Date.now() - startTime,
-      };
+      // Wait before next poll
+      await new Promise(resolve => setTimeout(resolve, SETTLEMENT_POLL_INTERVAL_MS));
+    }
+
+    // If still no balance after all retries, fall back to recorded shares
+    if (shares <= 0.01) {
+      if (recordedShares > 0) {
+        this.log(`⚠️ On-chain settlement not detected after ${Math.round((Date.now() - settlementStart) / 1000)}s, using recorded shares: ${recordedShares.toFixed(2)}`);
+        shares = recordedShares;
+      } else {
+        return {
+          success: false,
+          leg: 'merge',
+          roundId,
+          error: `No shares to merge (on-chain balance 0 after ${Math.round((Date.now() - settlementStart) / 1000)}s wait, recorded=${recordedShares.toFixed(2)})`,
+          executionTimeMs: Date.now() - startTime,
+        };
+      }
+    }
+
+    // ✅ FIX: Retry merge transaction on transient errors (RPC rate limits, gas estimation).
+    // The public polygon-rpc.com endpoint can hit rate limits (-32090), causing
+    // eth_estimateGas to fail. Retrying after a delay usually succeeds.
+    const MERGE_MAX_RETRIES = 3;
+    const MERGE_RETRY_DELAY_MS = 10000; // 10 seconds (matches RPC "retry in 10s" message)
+
+    for (let mergeAttempt = 1; mergeAttempt <= MERGE_MAX_RETRIES; mergeAttempt++) {
+      try {
+        this.log(`🔄 Merging ${shares.toFixed(2)} UP + DOWN → USDC.e...${mergeAttempt > 1 ? ` (attempt ${mergeAttempt}/${MERGE_MAX_RETRIES})` : ''}`);
+
+        const result = await this.ctf.mergeByTokenIds(
+          this.market.conditionId,
+          tokenIds,
+          shares.toString()
+        );
+
+        if (result.success) {
+          this.log(`✅ Merge successful: ${shares.toFixed(2)} pairs → $${result.usdcReceived || shares.toFixed(2)} USDC.e`);
+          this.log(`   TxHash: ${result.txHash?.slice(0, 20)}...`);
+        }
+
+        return {
+          success: result.success,
+          leg: 'merge',
+          roundId,
+          shares,
+          txHash: result.txHash,
+          executionTimeMs: Date.now() - startTime,
+        };
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        const isTransient = errorMsg.includes('rate limit')
+          || errorMsg.includes('Too many requests')
+          || errorMsg.includes('UNPREDICTABLE_GAS_LIMIT')
+          || errorMsg.includes('SERVER_ERROR')
+          || errorMsg.includes('NETWORK_ERROR')
+          || errorMsg.includes('noNetwork')
+          || errorMsg.includes('could not detect network')
+          || errorMsg.includes('ENOTFOUND')
+          || errorMsg.includes('EAI_AGAIN')
+          || errorMsg.includes('timeout')
+          || errorMsg.includes('ETIMEDOUT')
+          || errorMsg.includes('ECONNRESET')
+          || errorMsg.includes('ECONNREFUSED');
+
+        if (isTransient && mergeAttempt < MERGE_MAX_RETRIES) {
+          this.log(`⚠️ Merge attempt ${mergeAttempt} failed (transient): ${errorMsg.slice(0, 100)}...`);
+          this.log(`   Retrying in ${MERGE_RETRY_DELAY_MS / 1000}s...`);
+          await new Promise(resolve => setTimeout(resolve, MERGE_RETRY_DELAY_MS));
+          continue;
+        }
+
+        // Non-transient error or final attempt — give up
+        this.log(`❌ Merge failed${mergeAttempt > 1 ? ` after ${mergeAttempt} attempts` : ''}: ${errorMsg}`);
+        return {
+          success: false,
+          leg: 'merge',
+          roundId,
+          error: errorMsg,
+          executionTimeMs: Date.now() - startTime,
+        };
+      }
+    }
+
+    // Should not reach here, but just in case
+    return {
+      success: false,
+      leg: 'merge',
+      roundId,
+      error: 'Merge exhausted all retries',
+      executionTimeMs: Date.now() - startTime,
     }
   }
 
@@ -1041,7 +1136,12 @@ export class DipArbService extends EventEmitter {
     }
 
     // Check for round expiration - exit Leg1 if Leg2 times out
-    if (this.currentRound && this.currentRound.phase === 'leg1_filled') {
+    // ✅ FIX: Skip timeout check while executing a trade to prevent race condition.
+    // Without this guard, emergencyExitLeg1 (SELL) can run concurrently with
+    // executeLeg2 (BUY) because checkAndStartNewRound is fire-and-forget.
+    // The SELL removes Leg1 tokens, causing the subsequent merge() to fail with
+    // "Insufficient token balance".
+    if (this.currentRound && this.currentRound.phase === 'leg1_filled' && !this.isExecuting) {
       const elapsed = (Date.now() - (this.currentRound.leg1?.timestamp || this.currentRound.startTime)) / 1000;
       if (elapsed > this.config.leg2TimeoutSeconds) {
         // ✅ FIX: Exit Leg1 position to avoid unhedged exposure
@@ -1151,6 +1251,50 @@ export class DipArbService extends EventEmitter {
     }
   }
 
+  // ===== Private: Post-Trade Verification =====
+
+  /**
+   * ✅ FIX: Verify actual on-chain token balance after a trade.
+   *
+   * Market orders may fill at different amounts due to slippage, especially
+   * during volatile dips. This method queries the actual on-chain balance
+   * and adjusts the recorded shares downward if the actual balance is less
+   * than what was recorded.
+   *
+   * @param side - Which side was bought ('UP' or 'DOWN')
+   * @param recordedShares - The shares amount recorded from the order
+   * @returns Adjusted shares (may be less than recorded), or recordedShares if check fails
+   */
+  private async verifyPostTradeBalance(side: DipArbSide, recordedShares: number): Promise<number> {
+    if (!this.ctf || !this.market) return recordedShares;
+
+    try {
+      const balances = await this.ctf.getPositionBalanceByTokenIds(
+        this.market.conditionId,
+        { yesTokenId: this.market.upTokenId, noTokenId: this.market.downTokenId }
+      );
+      const actualBalance = side === 'UP'
+        ? parseFloat(balances.yesBalance)
+        : parseFloat(balances.noBalance);
+
+      // Only adjust downward: if on-chain balance < recorded, we got fewer shares.
+      // If on-chain balance > recorded, there may be pre-existing tokens - keep recorded.
+      if (actualBalance > 0 && actualBalance < recordedShares - 0.01) {
+        this.log(`⚠️ Fill verification: ${side} on-chain=${actualBalance.toFixed(2)}, recorded=${recordedShares.toFixed(2)} → adjusting to actual`);
+        return actualBalance;
+      }
+
+      if (this.config.debug) {
+        this.log(`   On-chain ${side} balance: ${actualBalance.toFixed(2)} (recorded: ${recordedShares.toFixed(2)})`);
+      }
+
+      return recordedShares;
+    } catch {
+      // Non-critical: if balance query fails, use recorded value
+      return recordedShares;
+    }
+  }
+
   // ===== Private: Signal Detection =====
 
   private detectSignal(): DipArbSignal | null {
@@ -1170,8 +1314,8 @@ export class DipArbService extends EventEmitter {
     if (!this.currentRound || !this.market) return null;
 
     // Check if within trading window (轮次开始后的交易窗口)
-    const elapsed = (Date.now() - this.currentRound.startTime) / 60000;
-    if (elapsed > this.config.windowMinutes) {
+    const elapsed = (this.market.endTime.getTime() - Date.now()) / 60000;
+    if (elapsed <15 - this.config.windowMinutes) {
       return null;
     }
 

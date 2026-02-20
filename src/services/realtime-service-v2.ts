@@ -326,6 +326,10 @@ export class RealtimeServiceV2 extends EventEmitter {
   // Timer to batch market subscription updates
   private marketSubscriptionBatchTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // Live data subscriptions to re-establish on reconnect
+  private activeActivityFilter: { event_slug?: string; market_slug?: string } | null | undefined = undefined;
+  // undefined = no activity subscription; null = subscribed with no filter
+
   // Caches
   private priceCache: Map<string, PriceUpdate> = new Map();
   private bookCache: Map<string, OrderbookSnapshot> = new Map();
@@ -395,11 +399,13 @@ export class RealtimeServiceV2 extends EventEmitter {
       debug: this.config.debug,
     });
 
-    // Crypto client for LIVE_DATA channel (crypto_prices)
+    // Crypto client for LIVE_DATA channel (crypto_prices, activity, comments, etc.)
+    // Uses text-based ping ("ping"/"pong" strings) per @polymarket/real-time-data-client
     this.cryptoClient = new RealTimeDataClient({
       url: WS_ENDPOINTS.LIVE_DATA,
       onConnect: (client) => {
         this.handleCryptoConnect(client);
+        this.resubscribeLiveDataTopics();
         cryptoConnectResolve!();
       },
       onMessage: this.handleCryptoMessage.bind(this),
@@ -409,6 +415,7 @@ export class RealtimeServiceV2 extends EventEmitter {
       },
       autoReconnect: this.config.autoReconnect,
       pingInterval: this.config.pingInterval,
+      pingMode: 'text',
       debug: this.config.debug,
     });
 
@@ -889,24 +896,22 @@ export class RealtimeServiceV2 extends EventEmitter {
     const subId = `activity_${++this.subscriptionIdCounter}`;
 
     // Build filter object with snake_case keys (as expected by the server)
-    // Only include filters if we have actual filter values
     const hasFilter = filter.eventSlug || filter.marketSlug;
     const filterObj: Record<string, string> = {};
     if (filter.eventSlug) filterObj.event_slug = filter.eventSlug;
     if (filter.marketSlug) filterObj.market_slug = filter.marketSlug;
 
-    // Create subscription objects - only include filters field if we have filters
-    const subscriptions = hasFilter
-      ? [
-          { topic: 'activity', type: 'trades', filters: JSON.stringify(filterObj) },
-          { topic: 'activity', type: 'orders_matched', filters: JSON.stringify(filterObj) },
-        ]
-      : [
-          { topic: 'activity', type: 'trades' },
-          { topic: 'activity', type: 'orders_matched' },
-        ];
+    // Activity topic lives on the LIVE_DATA endpoint (wss://ws-live-data.polymarket.com),
+    // NOT the CLOB market endpoint. Must use cryptoClient with the real-time-data-client format.
+    const serverFilter = hasFilter ? filterObj as { event_slug?: string; market_slug?: string } : undefined;
+    this.activeActivityFilter = serverFilter ?? null;
 
-    this.sendSubscription({ subscriptions });
+    if (this.cryptoClient) {
+      this.cryptoClient.subscribeActivity(serverFilter);
+      this.log(`Subscribed to activity via live-data client (filter: ${hasFilter ? JSON.stringify(filterObj) : 'none'})`);
+    } else {
+      this.log('Cannot subscribe to activity: crypto/live-data client not connected');
+    }
 
     const handler = (trade: ActivityTrade) => handlers.onTrade?.(trade);
     this.on('activityTrade', handler);
@@ -917,7 +922,10 @@ export class RealtimeServiceV2 extends EventEmitter {
       type: '*',
       unsubscribe: () => {
         this.off('activityTrade', handler);
-        this.sendUnsubscription({ subscriptions });
+        this.activeActivityFilter = undefined;
+        if (this.cryptoClient) {
+          this.cryptoClient.unsubscribeActivity(serverFilter);
+        }
         this.subscriptions.delete(subId);
       },
     };
@@ -1355,6 +1363,22 @@ export class RealtimeServiceV2 extends EventEmitter {
     this.emit('cryptoConnected');
   }
 
+  /**
+   * Re-establish live data subscriptions after reconnection.
+   * The live data endpoint (wss://ws-live-data.polymarket.com) handles:
+   * activity, comments, rfq, crypto_prices, equity_prices, etc.
+   */
+  private resubscribeLiveDataTopics(): void {
+    if (!this.cryptoClient) return;
+
+    // Re-subscribe to activity if it was active
+    if (this.activeActivityFilter !== undefined) {
+      const filter = this.activeActivityFilter === null ? undefined : this.activeActivityFilter;
+      this.cryptoClient.subscribeActivity(filter);
+      this.log(`Resubscribed to activity after reconnect (filter: ${filter ? JSON.stringify(filter) : 'none'})`);
+    }
+  }
+
   private handleCryptoMessage(_client: RealTimeDataClientInterface, message: Message): void {
     this.log(`Crypto received: ${message.topic}:${message.type}`);
 
@@ -1367,6 +1391,10 @@ export class RealtimeServiceV2 extends EventEmitter {
 
       case 'crypto_prices_chainlink':
         this.handleCryptoChainlinkPriceMessage(payload, message.timestamp);
+        break;
+
+      case 'activity':
+        this.handleActivityMessage(message.type, payload, message.timestamp);
         break;
 
       default:
@@ -1578,21 +1606,38 @@ export class RealtimeServiceV2 extends EventEmitter {
     }
   }
 
-  private handleActivityMessage(type: string, payload: Record<string, unknown>, timestamp: number): void {
+  private handleActivityMessage(_type: string, payload: Record<string, unknown>, timestamp: number): void {
+    // Handle batch payloads: some messages may contain an array of trades
+    if (Array.isArray(payload)) {
+      for (const item of payload) {
+        if (typeof item === 'object' && item !== null) {
+          this.emitActivityTrade(item as Record<string, unknown>, timestamp);
+        }
+      }
+      return;
+    }
+
+    this.emitActivityTrade(payload, timestamp);
+  }
+
+  private emitActivityTrade(payload: Record<string, unknown>, timestamp: number): void {
+    // Support both camelCase and snake_case field names
+    const traderAddress = (payload.proxyWallet ?? payload.proxy_wallet) as string | undefined;
+
     const trade: ActivityTrade = {
-      asset: payload.asset as string || '',
-      conditionId: payload.conditionId as string || '',
-      eventSlug: payload.eventSlug as string || '',
-      marketSlug: payload.slug as string || '',
-      outcome: payload.outcome as string || '',
+      asset: (payload.asset ?? payload.asset_id ?? '') as string,
+      conditionId: (payload.conditionId ?? payload.condition_id ?? '') as string,
+      eventSlug: (payload.eventSlug ?? payload.event_slug ?? '') as string,
+      marketSlug: (payload.slug ?? payload.market_slug ?? '') as string,
+      outcome: (payload.outcome ?? '') as string,
       price: Number(payload.price) || 0,
-      side: payload.side as 'BUY' | 'SELL',
+      side: (payload.side as 'BUY' | 'SELL'),
       size: Number(payload.size) || 0,
       timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
-      transactionHash: payload.transactionHash as string || '',
+      transactionHash: (payload.transactionHash ?? payload.transaction_hash ?? '') as string,
       trader: {
-        name: payload.name as string | undefined,
-        address: payload.proxyWallet as string | undefined,
+        name: (payload.name ?? payload.pseudonym) as string | undefined,
+        address: traderAddress,
       },
     };
     this.emit('activityTrade', trade);

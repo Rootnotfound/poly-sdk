@@ -147,8 +147,14 @@ export interface AutoCopyTradingOptions {
 
   /** Minimum trade value to copy (USDC) */
   minTradeSize?: number;
+  /** Platform minimum order size in USDC (default 1; set lower e.g. 0.1 to attempt sub-$1 orders) */
+  minOrderSizeUsdc?: number;
   /** Only copy BUY or SELL trades */
   sideFilter?: 'BUY' | 'SELL';
+  /** When true, SELL trades bypass minTradeSize and maxSizePerTrade limits */
+  noSellLimits?: boolean;
+  /** Skip trade when price per share is above this (e.g. 0.96) */
+  maxPricePerShare?: number;
 
   /** Dry run mode */
   dryRun?: boolean;
@@ -168,6 +174,10 @@ export interface AutoCopyTradingStats {
   tradesSkipped: number;
   tradesFailed: number;
   totalUsdcSpent: number;
+  /** Total activity messages received from WebSocket (before any filtering) */
+  activityReceived: number;
+  /** Activity messages that matched target addresses */
+  activityMatched: number;
 }
 
 /**
@@ -690,6 +700,8 @@ export class SmartMoneyService {
 
   private activeSubscription: { unsubscribe: () => void } | null = null;
   private tradeHandlers: Set<(trade: SmartMoneyTrade) => void> = new Set();
+  private activityReceived = 0;
+  private activityMatched = 0;
 
   constructor(
     walletService: WalletService,
@@ -715,6 +727,55 @@ export class SmartMoneyService {
    */
   setDataApiClient(dataApi: DataApiClient): void {
     this.dataApi = dataApi;
+  }
+
+  /**
+   * Resolve an EOA or proxy wallet address to the Polymarket proxy wallet.
+   *
+   * The Polymarket activity WebSocket reports trades using `proxyWallet`,
+   * which differs from a user's main EOA address. This method calls the
+   * Gamma API `/public-profile` endpoint to discover the proxy wallet.
+   *
+   * @returns The proxy wallet address, or the original address if resolution fails.
+   */
+  async resolveProxyWallet(address: string): Promise<string> {
+    try {
+      const res = await fetch(
+        `https://gamma-api.polymarket.com/public-profile?address=${address}`
+      );
+      if (!res.ok) return address;
+      const data = await res.json() as Record<string, unknown>;
+      const proxy = data.proxyWallet as string | undefined;
+      if (proxy && proxy.length > 0) {
+        return proxy.toLowerCase();
+      }
+    } catch {
+      // Fall through — return original address
+    }
+    return address.toLowerCase();
+  }
+
+  /**
+   * Resolve a list of addresses to their proxy wallets.
+   * Returns a map of original → proxy, plus deduplicated proxy list.
+   */
+  async resolveProxyWallets(
+    addresses: string[]
+  ): Promise<{ proxyAddresses: string[]; mapping: Map<string, string> }> {
+    const mapping = new Map<string, string>();
+    const proxySet = new Set<string>();
+
+    await Promise.all(
+      addresses.map(async (addr) => {
+        const proxy = await this.resolveProxyWallet(addr);
+        mapping.set(addr.toLowerCase(), proxy);
+        proxySet.add(proxy);
+        // Also keep the original in case it IS a proxy wallet already
+        proxySet.add(addr.toLowerCase());
+      })
+    );
+
+    return { proxyAddresses: [...proxySet], mapping };
   }
 
   // ============================================================================
@@ -841,6 +902,8 @@ export class SmartMoneyService {
     trade: ActivityTrade,
     options: { filterAddresses?: string[]; minSize?: number; smartMoneyOnly?: boolean }
   ): Promise<void> {
+    this.activityReceived++;
+
     const rawAddress = trade.trader?.address;
     if (!rawAddress) return;
 
@@ -851,6 +914,8 @@ export class SmartMoneyService {
       const normalized = options.filterAddresses.map(a => a.toLowerCase());
       if (!normalized.includes(traderAddress)) return;
     }
+
+    this.activityMatched++;
 
     // Size filter
     if (options.minSize && trade.size < options.minSize) return;
@@ -932,6 +997,21 @@ export class SmartMoneyService {
       throw new Error('No target addresses. Use targetAddresses or topN.');
     }
 
+    // Resolve EOA addresses to proxy wallets.
+    // Polymarket's activity WebSocket reports trades using proxyWallet,
+    // which is different from a user's main EOA address.
+    const { proxyAddresses, mapping } = await this.resolveProxyWallets(targetAddresses);
+    mapping.forEach((proxy, original) => {
+      if (original !== proxy) {
+        console.log(`[SmartMoney] Resolved ${original.slice(0, 10)}... → proxy ${proxy.slice(0, 10)}...`);
+      }
+    });
+    targetAddresses = proxyAddresses;
+
+    // Reset activity counters
+    this.activityReceived = 0;
+    this.activityMatched = 0;
+
     // Stats
     const stats: AutoCopyTradingStats = {
       startTime,
@@ -940,6 +1020,8 @@ export class SmartMoneyService {
       tradesSkipped: 0,
       tradesFailed: 0,
       totalUsdcSpent: 0,
+      activityReceived: 0,
+      activityMatched: 0,
     };
 
     // Config
@@ -948,7 +1030,10 @@ export class SmartMoneyService {
     const maxSlippage = options.maxSlippage ?? 0.03;
     const orderType = options.orderType ?? 'FOK';
     const minTradeSize = options.minTradeSize ?? 10;
+    const minOrderSizeUsdc = options.minOrderSizeUsdc ?? 1;
     const sideFilter = options.sideFilter;
+    const noSellLimits = options.noSellLimits ?? false;
+    const maxPricePerShare = options.maxPricePerShare;
     const delay = options.delay ?? 0;
     const dryRun = options.dryRun ?? false;
 
@@ -964,8 +1049,9 @@ export class SmartMoneyService {
           }
 
           // Filters
+          const isSellBypass = noSellLimits && trade.side === 'SELL';
           const tradeValue = trade.size * trade.price;
-          if (tradeValue < minTradeSize) {
+          if (minTradeSize > 0 && !isSellBypass && tradeValue < minTradeSize) {
             stats.tradesSkipped++;
             return;
           }
@@ -975,19 +1061,23 @@ export class SmartMoneyService {
             return;
           }
 
+          if (maxPricePerShare !== undefined && trade.price > maxPricePerShare) {
+            stats.tradesSkipped++;
+            return;
+          }
+
           // Calculate size
           let copySize = trade.size * sizeScale;
           let copyValue = copySize * trade.price;
 
-          // Enforce max size
-          if (copyValue > maxSizePerTrade) {
+          // Enforce max size (skip for SELL when noSellLimits)
+          if (!isSellBypass && copyValue > maxSizePerTrade) {
             copySize = maxSizePerTrade / trade.price;
             copyValue = maxSizePerTrade;
           }
 
-          // Polymarket minimum order is $1
-          const MIN_ORDER_SIZE = 1;
-          if (copyValue < MIN_ORDER_SIZE) {
+          // Skip if copy order value is below minimum
+          if (copyValue < minOrderSizeUsdc) {
             stats.tradesSkipped++;
             return;
           }
@@ -1030,6 +1120,42 @@ export class SmartMoneyService {
               price: slippagePrice,
               orderType,
             });
+
+            // Retry SELL as FAK if FOK failed due to "couldn't be fully filled"
+            const err = result.errorMsg ?? '';
+            const isFokNotFilled =
+              !result.success &&
+              trade.side === 'SELL' &&
+              orderType === 'FOK' &&
+              (err.includes("couldn't be fully filled") ||
+                (err.includes('FOK') && err.includes('fully filled')));
+            if (isFokNotFilled && this.tradingService) {
+              console.log('[SmartMoney] SELL FOK failed (not fully filled), retrying as FAK...');
+              let retryResult = await this.tradingService.createMarketOrder({
+                tokenId,
+                side: trade.side,
+                amount: usdcAmount,
+                price: slippagePrice,
+                orderType: 'FAK',
+              });
+              if (retryResult.success) {
+                result = retryResult;
+              } else {
+                // FAK at same price failed; sell at market (aggressive price) anyway
+                const marketSellPrice = 0.01;
+                console.log('[SmartMoney] SELL FAK retry failed, selling at market price (', marketSellPrice, ')...');
+                const marketResult = await this.tradingService.createMarketOrder({
+                  tokenId,
+                  side: trade.side,
+                  amount: usdcAmount,
+                  price: marketSellPrice,
+                  orderType: 'FAK',
+                });
+                if (marketResult.success) {
+                  result = marketResult;
+                }
+              }
+            }
           }
 
           if (result.success) {
@@ -1055,7 +1181,11 @@ export class SmartMoneyService {
       isActive: true,
       stats,
       stop: () => subscription.unsubscribe(),
-      getStats: () => ({ ...stats }),
+      getStats: () => ({
+        ...stats,
+        activityReceived: this.activityReceived,
+        activityMatched: this.activityMatched,
+      }),
     };
   }
 
