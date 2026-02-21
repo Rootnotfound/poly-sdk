@@ -9,10 +9,8 @@
  * - Rewards tracking
  * - Balance management
  *
- * Important: Polymarket enforces minimum order requirements:
- * - Minimum order size: 5 shares (MIN_ORDER_SIZE_SHARES)
- * - Minimum order value: $1 USDC (MIN_ORDER_VALUE_USDC)
- * Orders below these limits are validated and rejected before sending to API.
+ * Important: Polymarket enforces minimum $1 USDC for market orders. Minimum order size
+ * (shares) is validated client-side; orders below limits are rejected before sending.
  *
  * Note: Market data methods have been moved to MarketService.
  */
@@ -428,15 +426,9 @@ export class TradingService {
   /**
    * Create and post a limit order
    *
-   * Note: Polymarket enforces minimum order requirements:
-   * - Minimum size: 5 shares (MIN_ORDER_SIZE_SHARES)
-   * - Minimum value: $1 USDC (MIN_ORDER_VALUE_USDC)
-   *
-   * Orders below these limits will be rejected by the API.
+   * Note: Polymarket enforces minimum size (shares) and $1 USDC value. Orders below are rejected by the API.
    */
   async createLimitOrder(params: LimitOrderParams): Promise<OrderResult> {
-    // Validate minimum order requirements before sending to API
-    // Use market-specific minimum if provided, otherwise fall back to global default
     const minOrderSize = params.minimumOrderSize ?? MIN_ORDER_SIZE_SHARES;
     if (params.size < minOrderSize) {
       return {
@@ -444,7 +436,6 @@ export class TradingService {
         errorMsg: `Order size (${params.size}) is below Polymarket minimum (${minOrderSize} shares)`,
       };
     }
-
     const orderValue = params.price * params.size;
     if (orderValue < MIN_ORDER_VALUE_USDC) {
       return {
@@ -500,13 +491,9 @@ export class TradingService {
   /**
    * Create and post a market order
    *
-   * Note: Polymarket enforces minimum order requirements:
-   * - Minimum value: $1 USDC (MIN_ORDER_VALUE_USDC)
-   *
-   * Market orders below this limit will be rejected by the API.
+   * Note: Polymarket enforces minimum $1 USDC for marketable orders. Orders below are rejected by the API.
    */
   async createMarketOrder(params: MarketOrderParams): Promise<OrderResult> {
-    // Validate minimum order value before sending to API
     if (params.amount < MIN_ORDER_VALUE_USDC) {
       return {
         success: false,

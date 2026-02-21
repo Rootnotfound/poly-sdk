@@ -38,11 +38,8 @@ const TARGET_ADDRESSES: string[] = [
 ];
 
 const DRY_RUN = process.env.DRY_RUN === 'false' ? false : true;
-const SIZE_SCALE = 0.05;           // Copy 5% of their trade size
-const MAX_SIZE_PER_TRADE = 10;     // Nominal max per trade (BUY only)
-const CAP_PER_TRADE_USD = 5;       // If copy size > $5, cap at $5
-const effectiveMaxPerTrade = Math.min(MAX_SIZE_PER_TRADE, CAP_PER_TRADE_USD);
-const MIN_TRADE_SIZE = 1;    // Skip order when copy order value is below this ($)
+const SIZE_SCALE = 0.3;           // Copy 30% of their trade size
+const MIN_TRADE_SIZE = 1;    // Skip BUY when copy value below this ($); SELL has no minimum
 const MAX_PRICE_PER_SHARE = 0.96; // Skip trade when price per share > this
 const MAX_SLIPPAGE = 0.05;        // 5% slippage
 const STATS_INTERVAL_MS = 60_000; // Print stats every 60s
@@ -79,8 +76,7 @@ async function main() {
   console.log(`Mode:           ${DRY_RUN ? '🧪 DRY RUN' : '🔴 LIVE TRADING'}`);
   console.log(`Targets:        ${allAddresses.length} wallet(s)`);
   console.log(`Size Scale:     ${SIZE_SCALE * 100}%`);
-  console.log(`Max per trade:  $${effectiveMaxPerTrade} (BUY only; cap at $${CAP_PER_TRADE_USD})`);
-  console.log(`Min trade size: $${MIN_TRADE_SIZE} (skip if order value below)`);
+  console.log(`Min trade size: $${MIN_TRADE_SIZE} (skip BUY when below; SELL any size)`);
   console.log(`Max price/share: $${MAX_PRICE_PER_SHARE} (skip if above)`);
   console.log(`SELL limits:    none`);
   console.log(`Max slippage:   ${MAX_SLIPPAGE * 100}%`);
@@ -130,7 +126,7 @@ async function main() {
   const subscription = await sdk.smartMoney.startAutoCopyTrading({
     targetAddresses: allAddresses,
     sizeScale: SIZE_SCALE,
-    maxSizePerTrade: effectiveMaxPerTrade,
+    maxSizePerTrade: Infinity,
     maxSlippage: MAX_SLIPPAGE,
     orderType: 'FOK',
     minTradeSize: 0,
@@ -138,18 +134,17 @@ async function main() {
     maxPricePerShare: MAX_PRICE_PER_SHARE,
     noSellLimits: true,
     dryRun: DRY_RUN,
+    getPositionSharesForToken: (tokenId) => holdings.get(tokenId)?.shares ?? 0,
 
     onTrade: (trade, result) => {
       const now = new Date().toLocaleTimeString();
       const status = result.success ? '✅' : '❌';
       const traderLabel = trade.traderName || `${trade.traderAddress.slice(0, 8)}...${trade.traderAddress.slice(-4)}`;
       const origValue = trade.size * trade.price;
-      let copySize = trade.size * SIZE_SCALE;
-      let copyValue = copySize * trade.price;
-      if (copyValue > effectiveMaxPerTrade) {
-        copySize = effectiveMaxPerTrade / trade.price;
-        copyValue = effectiveMaxPerTrade;
-      }
+      const computedSize = trade.size * SIZE_SCALE;
+      const computedValue = computedSize * trade.price;
+      const copySize = (result as { copySizeUsed?: number }).copySizeUsed ?? computedSize;
+      const copyValue = (result as { copyValueUsed?: number }).copyValueUsed ?? computedValue;
       const slippagePrice = trade.side === 'BUY'
         ? trade.price * (1 + MAX_SLIPPAGE)
         : trade.price * (1 - MAX_SLIPPAGE);

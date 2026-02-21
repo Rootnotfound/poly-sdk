@@ -159,6 +159,13 @@ export interface AutoCopyTradingOptions {
   /** Dry run mode */
   dryRun?: boolean;
 
+  /**
+   * When copy SELL value is below minOrderSizeUsdc ($1), get position shares for that token.
+   * If provided and returns > 0, we sell that many shares (sell all) instead of the tiny order.
+   * Sync or async; return 0 if no position.
+   */
+  getPositionSharesForToken?: (tokenId: string) => number | Promise<number>;
+
   /** Callbacks */
   onTrade?: (trade: SmartMoneyTrade, result: OrderResult) => void;
   onError?: (error: Error) => void;
@@ -1076,15 +1083,10 @@ export class SmartMoneyService {
             copyValue = maxSizePerTrade;
           }
 
-          // Skip if copy order value is below minimum
-          if (copyValue < minOrderSizeUsdc) {
+          // Skip BUY when copy value is below minimum (Polymarket $1 min); SELL has no minimum
+          if (trade.side === 'BUY' && copyValue < minOrderSizeUsdc) {
             stats.tradesSkipped++;
             return;
-          }
-
-          // Delay
-          if (delay > 0) {
-            await new Promise(resolve => setTimeout(resolve, delay));
           }
 
           // Token
@@ -1092,6 +1094,24 @@ export class SmartMoneyService {
           if (!tokenId) {
             stats.tradesSkipped++;
             return;
+          }
+
+          // When copy SELL is below $1, sell all positions for this token if getter provided
+          if (trade.side === 'SELL' && copyValue < minOrderSizeUsdc && options.getPositionSharesForToken) {
+            const positionShares = await Promise.resolve(options.getPositionSharesForToken(tokenId));
+            if (positionShares > 0) {
+              copySize = positionShares;
+              copyValue = copySize * trade.price;
+              console.log(`[SmartMoney] Copy SELL < $1, selling all positions for token (${copySize.toFixed(2)} shares, ~$${copyValue.toFixed(2)})`);
+            } else {
+              stats.tradesSkipped++;
+              return;
+            }
+          }
+
+          // Delay
+          if (delay > 0) {
+            await new Promise(resolve => setTimeout(resolve, delay));
           }
 
           // Price with slippage
@@ -1173,7 +1193,7 @@ export class SmartMoneyService {
             stats.tradesFailed++;
           }
 
-          options.onTrade?.(trade, result);
+          options.onTrade?.(trade, { ...result, copySizeUsed: copySize, copyValueUsed: copyValue });
         } catch (error) {
           stats.tradesFailed++;
           options.onError?.(error instanceof Error ? error : new Error(String(error)));
