@@ -54,7 +54,8 @@ async function main() {
   const smartMoneyService = new SmartMoneyService(
     walletService,
     realtimeService,
-    tradingService
+    tradingService,
+    dataApi  // DataApiClient (required)
   );
 
   const ourAddress = tradingService.getAddress().toLowerCase();

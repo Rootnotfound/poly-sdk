@@ -321,6 +321,8 @@ export interface TradeEventPayload {
   timestamp: string | number;
   /** Last update timestamp */
   last_update: string | number;
+  /** Server-side match timestamp (when CLOB engine matched the order) */
+  matchtime?: string | number;
 }
 
 /**
@@ -531,6 +533,8 @@ export interface RealTimeDataClientInterface {
   connect(): void;
   /** Disconnect from WebSocket server */
   disconnect(): void;
+  /** Force reconnect by terminating and auto-reconnecting */
+  forceReconnect(): void;
   /** @deprecated Use subscribeMarket or subscribeUser instead */
   subscribe(msg: { subscriptions: SubscriptionMessage[] }): void;
   /** @deprecated Use unsubscribeMarket instead */

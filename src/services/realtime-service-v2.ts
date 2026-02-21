@@ -135,58 +135,13 @@ export interface UserTrade {
   side: 'BUY' | 'SELL';
   status: 'MATCHED' | 'MINED' | 'CONFIRMED' | 'RETRYING' | 'FAILED';
   timestamp: number;
+  /** Server-side match timestamp (ms) — when CLOB engine matched the order */
+  matchTime?: number;
   transactionHash?: string;
   /** Taker's order ID - use this to link trade to order */
   takerOrderId?: string;
   /** Maker orders involved in this trade */
   makerOrders?: MakerOrderInfo[];
-}
-
-// Activity types
-/**
- * Activity trade from WebSocket
- *
- * 实测验证 (2025-12-28)：proxyWallet 和 name 是顶层字段，不在 trader 对象里
- */
-export interface ActivityTrade {
-  /** Token ID (用于下单) */
-  asset: string;
-  /** Market condition ID */
-  conditionId: string;
-  /** Event slug */
-  eventSlug: string;
-  /** Market slug (可用于过滤) */
-  marketSlug: string;
-  /** Outcome (Yes/No) */
-  outcome: string;
-  /** Trade price */
-  price: number;
-  /** Trade side */
-  side: 'BUY' | 'SELL';
-  /** Trade size in shares */
-  size: number;
-  /** Timestamp (Unix seconds) */
-  timestamp: number;
-  /** Transaction hash */
-  transactionHash: string;
-
-  // ========== 交易者信息 ==========
-
-  /**
-   * Trader info object - 用于 Copy Trading 过滤目标钱包
-   *
-   * 注意: 实测验证 (2025-12-28) 数据结构为:
-   * {
-   *   trader: { name: "username", address: "0x..." }
-   * }
-   * 而非顶层 proxyWallet
-   */
-  trader?: {
-    /** 交易者用户名 */
-    name?: string;
-    /** 交易者钱包地址 - Copy Trading 过滤关键字段！ */
-    address?: string;
-  };
 }
 
 // External price types
@@ -265,11 +220,6 @@ export interface MarketDataHandlers {
 export interface UserDataHandlers {
   onOrder?: (order: UserOrder) => void;
   onTrade?: (trade: UserTrade) => void;
-  onError?: (error: Error) => void;
-}
-
-export interface ActivityHandlers {
-  onTrade?: (trade: ActivityTrade) => void;
   onError?: (error: Error) => void;
 }
 
@@ -447,6 +397,19 @@ export class RealtimeServiceV2 extends EventEmitter {
       if (!this.connected) {
         throw error;
       }
+    }
+  }
+
+  /**
+   * Force reconnect the market channel WebSocket.
+   * Terminates the current connection and triggers auto-reconnect,
+   * which will re-subscribe to all accumulated market tokens.
+   * Use when data flow stops but the connection appears alive.
+   */
+  reconnectMarketChannel(): void {
+    if (this.client) {
+      this.log('Force reconnecting market channel...');
+      this.client.forceReconnect();
     }
   }
 
@@ -1416,10 +1379,6 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.handleUserMessage(message.type, payload, message.timestamp);
         break;
 
-      case 'activity':
-        this.handleActivityMessage(message.type, payload, message.timestamp);
-        break;
-
       case 'crypto_prices':
         this.handleCryptoPriceMessage(payload, message.timestamp);
         break;
@@ -1588,6 +1547,10 @@ export class RealtimeServiceV2 extends EventEmitter {
         }));
       }
 
+      // Extract matchtime — CLOB server-side match timestamp (more accurate than payload.timestamp)
+      const matchTimeRaw = payload.matchtime as string | number | undefined;
+      const matchTime = matchTimeRaw ? Number(matchTimeRaw) : undefined;
+
       const trade: UserTrade = {
         tradeId: payload.trade_id as string || '',
         market: payload.market as string || '',
@@ -1597,6 +1560,7 @@ export class RealtimeServiceV2 extends EventEmitter {
         side: payload.side as 'BUY' | 'SELL',
         status: payload.status as 'MATCHED' | 'MINED' | 'CONFIRMED' | 'RETRYING' | 'FAILED',
         timestamp,
+        matchTime,
         transactionHash: payload.transaction_hash as string | undefined,
         // New fields for order-trade linking
         takerOrderId: payload.taker_order_id as string | undefined,

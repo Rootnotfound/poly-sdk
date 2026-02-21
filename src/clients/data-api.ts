@@ -73,6 +73,7 @@ export interface Activity {
   // Transaction info
   timestamp: number;
   transactionHash: string;
+  proxyWallet?: string; // Wallet address (returned by API)
 
   // Market metadata (from API)
   title?: string;
@@ -1051,6 +1052,7 @@ export class DataApiClient {
         // Transaction info
         timestamp: this.normalizeTimestamp(a.timestamp),
         transactionHash: String(a.transactionHash || ''),
+        proxyWallet: a.proxyWallet !== undefined ? String(a.proxyWallet) : undefined,
 
         // Market metadata
         title: a.title !== undefined ? String(a.title) : undefined,

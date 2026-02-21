@@ -134,7 +134,6 @@ export type {
   MarketEvent,
   UserOrder,
   UserTrade,
-  ActivityTrade,
   CryptoPrice,
   EquityPrice,
   Comment,
@@ -145,7 +144,6 @@ export type {
   MarketSubscription,
   MarketDataHandlers,
   UserDataHandlers,
-  ActivityHandlers,
   CryptoPriceHandlers,
   EquityPriceHandlers,
 } from './services/realtime-service-v2.js';
@@ -400,6 +398,14 @@ export type {
   TopRewardMarket,
 } from './services/trading-service.js';
 
+// RelayerService - Gasless on-chain operations via Polymarket Builder Relayer
+export { RelayerService, RelayerState } from './services/relayer-service.js';
+export type {
+  RelayerServiceConfig,
+  RelayerResult,
+  SafeDeployResult,
+} from './services/relayer-service.js';
+
 // CTFManager - CTF operations + event monitoring (Recommended)
 export { CTFManager } from './services/ctf-manager.js';
 export type {
@@ -453,6 +459,7 @@ export {
   NATIVE_USDC_CONTRACT,    // Native USDC (0x3c49...) - NOT for CTF
   NEG_RISK_CTF_EXCHANGE,
   NEG_RISK_ADAPTER,
+  CTF_EXCHANGE,
   USDC_DECIMALS,
   calculateConditionId,
   parseUsdc,
@@ -552,6 +559,22 @@ export {
 } from './utils/price-utils.js';
 export type { TickSize } from './utils/price-utils.js';
 
+// Calldata decoder (for mempool pending TX decoding — copy-trading)
+export {
+  decodeMatchOrdersCalldata,
+  isSettlementTx,
+  extractTraderAddresses,
+  CTF_ROUTER,
+  NEG_RISK_ROUTER,
+  MATCH_ORDERS_SELECTOR,
+  ROUTER_ADDRESSES,
+  OrderSide,
+} from './utils/calldata-decoder.js';
+export type {
+  DecodedOrder,
+  DecodedMatchOrders,
+} from './utils/calldata-decoder.js';
+
 // Wallet Management (Hot Wallet for automated trading)
 export {
   HotWalletService,
@@ -642,8 +665,8 @@ export class PolymarketSDK {
       this.wallets,
       this.realtime,
       this.tradingService,
-      {},  // default config
-      this.dataApi  // pass dataApi for report generation
+      this.dataApi,  // DataApiClient (required)
+      {}  // default config
     );
 
     // Initialize DipArbService

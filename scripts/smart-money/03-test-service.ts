@@ -47,6 +47,7 @@ async function main() {
     walletService,
     realtimeService,
     tradingService,
+    dataApi,  // DataApiClient (required)
     {
       minPnl: 1000,      // Minimum $1000 PnL
       minPositions: 5,   // Minimum 5 positions

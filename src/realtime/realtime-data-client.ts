@@ -102,6 +102,15 @@ export class RealTimeDataClient implements RealTimeDataClientInterface {
   }
 
   /**
+   * Force reconnect by terminating the current connection.
+   * Triggers auto-reconnect if enabled, which will re-subscribe.
+   */
+  forceReconnect(): void {
+    this.log('Force reconnecting...');
+    this.handleDeadConnection();
+  }
+
+  /**
    * Disconnect from the WebSocket server
    */
   disconnect(): void {

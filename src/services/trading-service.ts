@@ -25,6 +25,10 @@ import {
   type TickSize,
 } from '@polymarket/clob-client';
 
+// SignatureType from @polymarket/order-utils (transitive dep, not directly importable)
+// Values: EOA = 0, POLY_PROXY = 1, POLY_GNOSIS_SAFE = 2
+const SIGNATURE_TYPE_POLY_GNOSIS_SAFE = 2;
+
 import { Wallet } from 'ethers';
 import { RateLimiter, ApiType } from '../core/rate-limiter.js';
 import type { UnifiedCache } from '../core/unified-cache.js';
@@ -97,6 +101,14 @@ export interface TradingServiceConfig {
   chainId?: number;
   /** Pre-generated API credentials (optional) */
   credentials?: ApiCredentials;
+  /** Builder API credentials (optional) - enables Builder mode with fee sharing and rewards */
+  builderCreds?: {
+    key: string;
+    secret: string;
+    passphrase: string;
+  };
+  /** Gnosis Safe address — required for Builder mode so orders use Safe as maker/funder */
+  safeAddress?: string;
 }
 
 // Order types
@@ -153,6 +165,9 @@ export interface Order {
    * undefined for GTC orders
    */
   expiration?: number;
+
+  /** Maker address (EOA or Safe) — from CLOB's maker_address field */
+  makerAddress?: string;
 }
 
 export interface OrderResult {
@@ -342,7 +357,23 @@ export class TradingService {
       };
     }
 
-    // Re-initialize with L2 auth (credentials)
+    // Construct BuilderConfig if builderCreds are provided
+    let builderConfig: any = undefined;
+    if (this.config.builderCreds) {
+      const { BuilderConfig } = await import('@polymarket/builder-signing-sdk');
+      builderConfig = new BuilderConfig({
+        localBuilderCreds: {
+          key: this.config.builderCreds.key,
+          secret: this.config.builderCreds.secret,
+          passphrase: this.config.builderCreds.passphrase,
+        },
+      });
+    }
+
+    // Builder mode: orders use Safe as maker, signed by EOA owner
+    const isBuilderMode = !!this.config.builderCreds && !!this.config.safeAddress;
+
+    // Re-initialize with L2 auth (credentials) and optional BuilderConfig
     this.clobClient = new ClobClient(
       CLOB_HOST,
       this.chainId,
@@ -351,7 +382,12 @@ export class TradingService {
         key: this.credentials.key,
         secret: this.credentials.secret,
         passphrase: this.credentials.passphrase,
-      }
+      },
+      isBuilderMode ? SIGNATURE_TYPE_POLY_GNOSIS_SAFE : undefined, // signatureType
+      isBuilderMode ? this.config.safeAddress : undefined,         // funderAddress (Safe holds the tokens)
+      undefined, // geoBlockToken
+      undefined, // useServerTime
+      builderConfig, // BuilderConfig (arg 9)
     );
 
     this.initialized = true;
@@ -725,6 +761,7 @@ export class TradingService {
           createdAt: order.created_at,
           updatedAt: Date.now(),
           expiration: order.expiration ? Number(order.expiration) : undefined,
+          makerAddress: (order as any).maker_address || undefined,
         };
       } catch (error) {
         // If order not found, return null instead of throwing

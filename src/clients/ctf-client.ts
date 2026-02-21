@@ -47,6 +47,9 @@ export const NATIVE_USDC_CONTRACT = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359'
 export const NEG_RISK_CTF_EXCHANGE = '0xC5d563A36AE78145C45a50134d48A1215220f80a';
 export const NEG_RISK_ADAPTER = '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296';
 
+/** CTF Exchange — Polymarket order matching contract for standard markets */
+export const CTF_EXCHANGE = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
+
 // USDC.e uses 6 decimals
 export const USDC_DECIMALS = 6;
 
@@ -64,6 +67,14 @@ const CTF_ABI = [
   // Check if condition is resolved
   'function payoutNumerators(bytes32 conditionId, uint256 outcomeIndex) view returns (uint256)',
   'function payoutDenominator(bytes32 conditionId) view returns (uint256)',
+];
+
+// NegRisk Adapter ABI — overloaded split/merge have same signature as CTF,
+// redeem has NegRisk-specific signature: (conditionId, amounts[])
+const NEG_RISK_ADAPTER_ABI = [
+  'function splitPosition(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] partition, uint256 amount) external',
+  'function mergePositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] partition, uint256 amount) external',
+  'function redeemPositions(bytes32 conditionId, uint256[] amounts) external',
 ];
 
 const ERC20_ABI = [
@@ -183,6 +194,7 @@ export class CTFClient {
   private provider: ethers.providers.JsonRpcProvider;
   private wallet: Wallet;
   private ctfContract: Contract;
+  private negRiskAdapterContract: Contract;
   private usdcContract: Contract;
   private gasPriceMultiplier: number;
   private confirmations: number;
@@ -195,6 +207,7 @@ export class CTFClient {
     this.provider = new ethers.providers.JsonRpcProvider(rpcUrl);
     this.wallet = new Wallet(config.privateKey, this.provider);
     this.ctfContract = new Contract(CTF_CONTRACT, CTF_ABI, this.wallet);
+    this.negRiskAdapterContract = new Contract(NEG_RISK_ADAPTER, NEG_RISK_ADAPTER_ABI, this.wallet);
     this.usdcContract = new Contract(USDC_CONTRACT, ERC20_ABI, this.wallet);
     this.gasPriceMultiplier = config.gasPriceMultiplier || 1.2;
     this.confirmations = config.confirmations || 1;
@@ -361,6 +374,62 @@ export class CTFClient {
   }
 
   /**
+   * Split USDC into YES + NO tokens using explicit token IDs
+   *
+   * Supports both standard CTF and NegRisk markets:
+   * - Standard: uses CTF contract directly
+   * - NegRisk: uses NegRisk Adapter (wraps CTF with wrapped collateral)
+   *
+   * @param conditionId - Market condition ID (from CLOB API)
+   * @param tokenIds - Token IDs from CLOB API
+   * @param amount - USDC amount (e.g., "100" for 100 USDC)
+   * @param isNegRisk - Whether this market uses NegRisk (from CLOB API neg_risk field)
+   * @returns SplitResult with transaction details
+   */
+  async splitByTokenIds(conditionId: string, tokenIds: TokenIds, amount: string, isNegRisk = false): Promise<SplitResult> {
+    const amountWei = ethers.utils.parseUnits(amount, USDC_DECIMALS);
+
+    const balance = await this.usdcContract.balanceOf(this.wallet.address);
+    if (balance.lt(amountWei)) {
+      throw new Error(`Insufficient USDC balance. Have: ${ethers.utils.formatUnits(balance, USDC_DECIMALS)}, Need: ${amount}`);
+    }
+
+    const targetContract = isNegRisk ? NEG_RISK_ADAPTER : CTF_CONTRACT;
+    const splitContract = isNegRisk ? this.negRiskAdapterContract : this.ctfContract;
+
+    // Check and approve USDC for the target contract
+    const allowance = await this.usdcContract.allowance(this.wallet.address, targetContract);
+    if (allowance.lt(amountWei)) {
+      const approveTx = await this.usdcContract.approve(
+        targetContract,
+        ethers.constants.MaxUint256,
+        await this.getGasOptions()
+      );
+      await approveTx.wait();
+    }
+
+    const tx = await splitContract.splitPosition(
+      USDC_CONTRACT,
+      ethers.constants.HashZero,
+      conditionId,
+      [1, 2],
+      amountWei,
+      await this.getGasOptions()
+    );
+
+    const receipt = await tx.wait();
+
+    return {
+      success: true,
+      txHash: receipt.transactionHash,
+      amount,
+      yesTokens: amount,
+      noTokens: amount,
+      gasUsed: receipt.gasUsed.toString(),
+    };
+  }
+
+  /**
    * Merge YES + NO tokens back to USDC
    *
    * @param conditionId - Market condition ID
@@ -377,7 +446,7 @@ export class CTFClient {
   async merge(conditionId: string, amount: string): Promise<MergeResult> {
     const amountWei = ethers.utils.parseUnits(amount, USDC_DECIMALS);
 
-    // Check token balances
+    // Check token balances using calculated position IDs
     const balances = await this.getPositionBalance(conditionId);
     const yesBalance = ethers.utils.parseUnits(balances.yesBalance, USDC_DECIMALS);
     const noBalance = ethers.utils.parseUnits(balances.noBalance, USDC_DECIMALS);
@@ -388,23 +457,49 @@ export class CTFClient {
       );
     }
 
-    // Execute merge
+    // Use safe amount: min(requested, yesBalance, noBalance)
+    let safeAmountWei = amountWei;
+    if (yesBalance.lt(safeAmountWei)) safeAmountWei = yesBalance;
+    if (noBalance.lt(safeAmountWei)) safeAmountWei = noBalance;
+
+    // Dry-run to catch revert reason before submitting actual transaction
+    try {
+      await this.ctfContract.callStatic.mergePositions(
+        USDC_CONTRACT,
+        ethers.constants.HashZero,
+        conditionId,
+        [1, 2],
+        safeAmountWei,
+      );
+    } catch (error: any) {
+      const reason = error?.reason || error?.error?.message || error?.message || 'unknown';
+      throw new Error(
+        `Merge dry-run failed (callStatic reverted): ${reason}. ` +
+        `Amount: ${ethers.utils.formatUnits(safeAmountWei, USDC_DECIMALS)}, ` +
+        `YES: ${balances.yesBalance}, NO: ${balances.noBalance}, ` +
+        `conditionId: ${conditionId}`
+      );
+    }
+
+    // Execute merge with explicit gasLimit
+    const gasOptions = await this.getGasOptions();
     const tx = await this.ctfContract.mergePositions(
       USDC_CONTRACT,
       ethers.constants.HashZero,
       conditionId,
       [1, 2],
-      amountWei,
-      await this.getGasOptions()
+      safeAmountWei,
+      { ...gasOptions, gasLimit: 500000 }
     );
 
     const receipt = await tx.wait();
 
+    const mergedAmount = ethers.utils.formatUnits(safeAmountWei, USDC_DECIMALS);
     return {
       success: true,
       txHash: receipt.transactionHash,
-      amount,
-      usdcReceived: amount, // 1:1 merge
+      amount: mergedAmount,
+      usdcReceived: mergedAmount,
       gasUsed: receipt.gasUsed.toString(),
     };
   }
@@ -412,19 +507,20 @@ export class CTFClient {
   /**
    * Merge YES and NO tokens back into USDC using explicit token IDs
    *
-   * This method uses the provided token IDs for balance checking, which is
-   * necessary when working with Polymarket CLOB markets where token IDs
-   * don't match the calculated position IDs.
+   * Supports both standard CTF and NegRisk markets:
+   * - Standard: uses CTF contract directly
+   * - NegRisk: uses NegRisk Adapter (wraps CTF with wrapped collateral)
    *
-   * @param conditionId - Market condition ID
+   * @param conditionId - Market condition ID (from CLOB API)
    * @param tokenIds - Token IDs from CLOB API
    * @param amount - Amount of tokens to merge
+   * @param isNegRisk - Whether this market uses NegRisk (from CLOB API neg_risk field)
    * @returns MergeResult with transaction details
    */
-  async mergeByTokenIds(conditionId: string, tokenIds: TokenIds, amount: string): Promise<MergeResult> {
+  async mergeByTokenIds(conditionId: string, tokenIds: TokenIds, amount: string, isNegRisk = false): Promise<MergeResult> {
     const amountWei = ethers.utils.parseUnits(amount, USDC_DECIMALS);
 
-    // Check token balances using the provided token IDs
+    // Check token balances using the provided CLOB token IDs
     const balances = await this.getPositionBalanceByTokenIds(conditionId, tokenIds);
     const yesBalance = ethers.utils.parseUnits(balances.yesBalance, USDC_DECIMALS);
     const noBalance = ethers.utils.parseUnits(balances.noBalance, USDC_DECIMALS);
@@ -435,23 +531,52 @@ export class CTFClient {
       );
     }
 
-    // Execute merge
-    const tx = await this.ctfContract.mergePositions(
+    // Use safe amount: min(requested, yesBalance, noBalance)
+    let safeAmountWei = amountWei;
+    if (yesBalance.lt(safeAmountWei)) safeAmountWei = yesBalance;
+    if (noBalance.lt(safeAmountWei)) safeAmountWei = noBalance;
+
+    // Select contract: NegRisk adapter for NegRisk markets, standard CTF otherwise
+    const mergeContract = isNegRisk ? this.negRiskAdapterContract : this.ctfContract;
+
+    // Dry-run to catch revert reason before submitting actual transaction
+    try {
+      await mergeContract.callStatic.mergePositions(
+        USDC_CONTRACT,
+        ethers.constants.HashZero,
+        conditionId,
+        [1, 2],
+        safeAmountWei,
+      );
+    } catch (error: any) {
+      const reason = error?.reason || error?.error?.message || error?.message || 'unknown';
+      throw new Error(
+        `Merge dry-run failed (callStatic reverted): ${reason}. ` +
+        `Amount: ${ethers.utils.formatUnits(safeAmountWei, USDC_DECIMALS)}, ` +
+        `YES: ${balances.yesBalance}, NO: ${balances.noBalance}, ` +
+        `conditionId: ${conditionId}, negRisk: ${isNegRisk}`
+      );
+    }
+
+    // Execute merge with explicit gasLimit
+    const gasOptions = await this.getGasOptions();
+    const tx = await mergeContract.mergePositions(
       USDC_CONTRACT,
       ethers.constants.HashZero,
       conditionId,
       [1, 2],
-      amountWei,
-      await this.getGasOptions()
+      safeAmountWei,
+      { ...gasOptions, gasLimit: 500000 }
     );
 
     const receipt = await tx.wait();
 
+    const mergedAmount = ethers.utils.formatUnits(safeAmountWei, USDC_DECIMALS);
     return {
       success: true,
       txHash: receipt.transactionHash,
-      amount,
-      usdcReceived: amount, // 1:1 merge
+      amount: mergedAmount,
+      usdcReceived: mergedAmount,
       gasUsed: receipt.gasUsed.toString(),
     };
   }
@@ -567,7 +692,8 @@ export class CTFClient {
   async redeemByTokenIds(
     conditionId: string,
     tokenIds: TokenIds,
-    outcome?: string
+    outcome?: string,
+    isNegRisk = false,
   ): Promise<RedeemResult> {
     // Check resolution status
     const resolution = await this.getMarketResolution(conditionId);
@@ -583,22 +709,38 @@ export class CTFClient {
 
     // Get token balance using Polymarket token IDs
     const balances = await this.getPositionBalanceByTokenIds(conditionId, tokenIds);
-    const tokenBalance = winningOutcome === 'YES' ? balances.yesBalance : balances.noBalance;
+    const yesBalance = balances.yesBalance;
+    const noBalance = balances.noBalance;
+    const tokenBalance = winningOutcome === 'YES' ? yesBalance : noBalance;
 
     if (parseFloat(tokenBalance) === 0) {
       throw new Error(`No ${winningOutcome} tokens to redeem`);
     }
 
-    // indexSets: [1] for YES, [2] for NO
-    const indexSets = winningOutcome === 'YES' ? [1] : [2];
+    const gasOptions = await this.getGasOptions();
+    let tx;
 
-    const tx = await this.ctfContract.redeemPositions(
-      USDC_CONTRACT,
-      ethers.constants.HashZero,
-      conditionId,
-      indexSets,
-      await this.getGasOptions()
-    );
+    if (isNegRisk) {
+      // NegRisk adapter: redeemPositions(conditionId, amounts[])
+      // amounts array has one entry per outcome index: [yesAmount, noAmount]
+      const yesAmountWei = ethers.utils.parseUnits(yesBalance, USDC_DECIMALS);
+      const noAmountWei = ethers.utils.parseUnits(noBalance, USDC_DECIMALS);
+      tx = await this.negRiskAdapterContract.redeemPositions(
+        conditionId,
+        [yesAmountWei, noAmountWei],
+        { ...gasOptions, gasLimit: 500000 }
+      );
+    } else {
+      // Standard CTF: redeemPositions(collateral, parentCollectionId, conditionId, indexSets)
+      const indexSets = winningOutcome === 'YES' ? [1] : [2];
+      tx = await this.ctfContract.redeemPositions(
+        USDC_CONTRACT,
+        ethers.constants.HashZero,
+        conditionId,
+        indexSets,
+        gasOptions
+      );
+    }
 
     const receipt = await tx.wait();
 
@@ -1094,6 +1236,7 @@ export class CTFClient {
   }
 
   // ===== Private Helpers =====
+
 
   /**
    * Calculate position ID for a given outcome (INTERNAL USE ONLY)
