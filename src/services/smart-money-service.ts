@@ -1121,16 +1121,24 @@ export class SmartMoneyService {
               orderType,
             });
 
-            // Retry SELL as FAK if FOK failed due to "couldn't be fully filled"
-            const err = result.errorMsg ?? '';
+            // Retry as FAK if FOK failed due to "couldn't be fully filled" (SELL or BUY)
+            const err = (result.errorMsg ?? '').trim();
+            const errLower = err.toLowerCase();
+            const isFokNotFilledMsg =
+              errLower.includes('fully filled') && (errLower.includes('fok') || errLower.includes('killed')) ||
+              errLower.includes("couldn't be fully filled") ||
+              errLower.includes('could not be fully filled') ||
+              errLower.includes('fully filled or killed');
             const isFokNotFilled =
               !result.success &&
-              trade.side === 'SELL' &&
               orderType === 'FOK' &&
-              (err.includes("couldn't be fully filled") ||
-                (err.includes('FOK') && err.includes('fully filled')));
+              isFokNotFilledMsg;
+            if (!result.success && orderType === 'FOK' && !isFokNotFilledMsg && err.length > 0) {
+              console.log('[SmartMoney] FOK order failed but retry not triggered. Error (first 120 chars):', err.slice(0, 120));
+            }
             if (isFokNotFilled && this.tradingService) {
-              console.log('[SmartMoney] SELL FOK failed (not fully filled), retrying as FAK...');
+              const sideLabel = trade.side === 'SELL' ? 'SELL' : 'BUY';
+              console.log(`[SmartMoney] ${sideLabel} FOK failed (not fully filled), retrying as FAK...`);
               let retryResult = await this.tradingService.createMarketOrder({
                 tokenId,
                 side: trade.side,
@@ -1141,14 +1149,14 @@ export class SmartMoneyService {
               if (retryResult.success) {
                 result = retryResult;
               } else {
-                // FAK at same price failed; sell at market (aggressive price) anyway
-                const marketSellPrice = 0.01;
-                console.log('[SmartMoney] SELL FAK retry failed, selling at market price (', marketSellPrice, ')...');
+                // FAK at same price failed; try at market (aggressive) price
+                const marketPrice = trade.side === 'SELL' ? 0.01 : 0.99;
+                console.log(`[SmartMoney] ${sideLabel} FAK retry failed, trying at market price (${marketPrice})...`);
                 const marketResult = await this.tradingService.createMarketOrder({
                   tokenId,
                   side: trade.side,
                   amount: usdcAmount,
-                  price: marketSellPrice,
+                  price: marketPrice,
                   orderType: 'FAK',
                 });
                 if (marketResult.success) {

@@ -38,7 +38,7 @@ const TARGET_ADDRESSES: string[] = [
 ];
 
 const DRY_RUN = process.env.DRY_RUN === 'false' ? false : true;
-const SIZE_SCALE = 0.1;           // Copy 5% of their trade size
+const SIZE_SCALE = 0.05;           // Copy 5% of their trade size
 const MAX_SIZE_PER_TRADE = 10;     // Nominal max per trade (BUY only)
 const CAP_PER_TRADE_USD = 5;       // If copy size > $5, cap at $5
 const effectiveMaxPerTrade = Math.min(MAX_SIZE_PER_TRADE, CAP_PER_TRADE_USD);

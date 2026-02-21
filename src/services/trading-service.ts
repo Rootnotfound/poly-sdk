@@ -48,6 +48,13 @@ export const POLYGON_AMOY = 80002;
 // CLOB Host
 const CLOB_HOST = 'https://clob.polymarket.com';
 
+/** Extract API error message from CLOB client / axios-style errors (response.data.error) */
+function getApiErrorMessage(error: unknown): string | undefined {
+  const err = error as { response?: { data?: { error?: string } } };
+  const msg = err.response?.data?.error;
+  return typeof msg === 'string' && msg.length > 0 ? msg : undefined;
+}
+
 // ============================================================================
 // Polymarket Order Minimums
 // ============================================================================
@@ -534,17 +541,22 @@ export class TradingService {
             ((result.orderID !== undefined && result.orderID !== '') ||
               (result.transactionsHashes !== undefined && result.transactionsHashes.length > 0)));
 
+        // CLOB client returns { error: "..." } on 400 (does not throw); expose as errorMsg for retry logic
+        const errorMsg = result.errorMsg ?? (result as { error?: string }).error;
+
         return {
           success,
           orderId: result.orderID,
           orderIds: result.orderIDs,
-          errorMsg: result.errorMsg,
+          errorMsg,
           transactionHashes: result.transactionsHashes,
         };
       } catch (error) {
+        const apiMsg = getApiErrorMessage(error);
+        const fallback = error instanceof Error ? error.message : String(error);
         return {
           success: false,
-          errorMsg: `Market order failed: ${error instanceof Error ? error.message : String(error)}`,
+          errorMsg: apiMsg ?? `Market order failed: ${fallback}`,
         };
       }
     });
