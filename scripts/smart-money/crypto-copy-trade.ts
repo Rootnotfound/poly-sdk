@@ -38,9 +38,9 @@ const TARGET_ADDRESSES: string[] = [
 ];
 
 const DRY_RUN = process.env.DRY_RUN === 'false' ? false : true;
-const SIZE_SCALE = 0.3;           // Copy 30% of their trade size
+const SIZE_SCALE = 1;           // Copy 30% of their trade size
 const MIN_TRADE_SIZE = 1;    // Skip BUY when copy value below this ($); SELL has no minimum
-const MAX_PRICE_PER_SHARE = 0.96; // Skip trade when price per share > this
+const MAX_PRICE_PER_SHARE = 0.97; // Skip trade when price per share > this
 const MAX_SLIPPAGE = 0.05;        // 5% slippage
 const STATS_INTERVAL_MS = 60_000; // Print stats every 60s
 

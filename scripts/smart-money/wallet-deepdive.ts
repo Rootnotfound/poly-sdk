@@ -11,7 +11,7 @@
  *
  * Env:
  *   WALLET_ADDRESS - Address to analyze (default: 0xe00740bce98a594e26861838885ab310ec3b548c)
- *   LAST_N_DAYS   - Time window for fetching trades and total ROI % in days (default: 30)
+ *   LAST_N_HOURS  - Time window for fetching trades and total ROI % in hours (default: 720 = 30 days)
  */
 
 import { PolymarketSDK } from '../../src/index.js';
@@ -19,8 +19,8 @@ import type { Position } from '../../src/clients/data-api.js';
 
 const DEFAULT_ADDRESS = '0xf247584e41117bbbe4cc06e4d2c95741792a5216';
 const MIN_VALUE_USD = 1;
-/** Time window in days; trades and ROI are computed over [now - N days, now] */
-const LAST_N_DAYS = Number(process.env.LAST_N_DAYS) || 30;
+/** Time window in hours; trades and ROI are computed over [now - N hours, now] */
+const LAST_N_HOURS = Number(process.env.LAST_N_HOURS) || 720;
 const MAX_TRADES_IN_WINDOW = 10000;
 
 interface Lot {
@@ -44,13 +44,22 @@ async function main() {
   console.log('='.repeat(60));
   console.log('Wallet Deep Dive - Sub-$1 Trades & ROI %');
   console.log('='.repeat(60));
-  const endTs = Date.now();
-  const startTs = endTs - LAST_N_DAYS * 24 * 60 * 60 * 1000;
-  const startDate = new Date(startTs).toISOString().slice(0, 10);
-  const endDate = new Date(endTs).toISOString().slice(0, 10);
+  const now = new Date();
+  const endTs = Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    now.getUTCHours(),
+    0,
+    0,
+    0
+  );
+  const startTs = endTs - LAST_N_HOURS * 60 * 60 * 1000;
+  const startUtc = new Date(startTs).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ' UTC');
+  const endUtc = new Date(endTs).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ' UTC');
 
   console.log(`Address:  ${address}`);
-  console.log(`Window:   last ${LAST_N_DAYS} days (${startDate} → ${endDate})`);
+  console.log(`Window:   last ${LAST_N_HOURS} hours (UTC) ${startUtc} → ${endUtc}`);
   console.log(`Filter:   value (size × price) < $${MIN_VALUE_USD}`);
   console.log('='.repeat(60));
 
@@ -244,7 +253,7 @@ async function main() {
   const totalReturnAll = realizedProceedsAll + redemptionAll;
   const roiAllPct = totalCostAll > 0 ? ((totalReturnAll - totalCostAll) / totalCostAll) * 100 : 0;
 
-  console.log('\n--- Total ROI % (last ' + LAST_N_DAYS + ' days, incl. redemption) ---');
+  console.log('\n--- Total ROI % (last ' + LAST_N_HOURS + ' hours, incl. redemption) ---');
   console.log(`Trades in window:         ${sorted.length}`);
   console.log(`Total BUY cost:            $${totalCostAll.toFixed(4)}`);
   console.log(`Realized from SELLs:       $${realizedProceedsAll.toFixed(4)}`);
