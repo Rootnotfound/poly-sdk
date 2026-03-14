@@ -588,10 +588,13 @@ export class DataApiClient {
   ): Promise<Activity[]> {
     const all: Activity[] = [];
     const limit = 500; // Max allowed by API
-    const API_OFFSET_LIMIT = 10000; // Hard limit from Polymarket API
+    const API_OFFSET_LIMIT = 10000; // Hard limit when no time filter
+    const HISTORICAL_OFFSET_LIMIT = 3000; // Max offset when start/end are used (API returns 400 if exceeded)
+    const isTimeFiltered = params?.start !== undefined || params?.end !== undefined;
+    const effectiveOffsetLimit = isTimeFiltered ? HISTORICAL_OFFSET_LIMIT : API_OFFSET_LIMIT;
     let offset = 0;
 
-    while (all.length < maxItems && offset < API_OFFSET_LIMIT) {
+    while (all.length < maxItems && offset < effectiveOffsetLimit) {
       const page = await this.getActivity(address, { ...params, limit, offset });
       all.push(...page);
       if (page.length < limit) break; // No more data
@@ -599,10 +602,12 @@ export class DataApiClient {
     }
 
     // Warn if we hit the API offset limit
-    if (offset >= API_OFFSET_LIMIT && all.length >= API_OFFSET_LIMIT) {
+    if (offset >= effectiveOffsetLimit && all.length >= effectiveOffsetLimit) {
       console.warn(
-        `[DataApiClient] Hit API offset limit (${API_OFFSET_LIMIT}). ` +
-          'Use time filtering (start/end params) to access older activity data.'
+        `[DataApiClient] Hit API offset limit (${effectiveOffsetLimit}${isTimeFiltered ? ' for time-filtered request' : ''}). ` +
+          (isTimeFiltered
+            ? 'Narrow the time window to fetch more activity.'
+            : 'Use time filtering (start/end params) to access older activity data.')
       );
     }
 

@@ -22,7 +22,7 @@
 
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { PolymarketSDK } from '../../src/index.js';
+import { PolymarketSDK, CTFClient } from '../../src/index.js';
 
 // ============================================================================
 // Configuration
@@ -104,6 +104,19 @@ async function main() {
   const sdk = await PolymarketSDK.create({ privateKey });
   console.log('  ✅ SDK ready (WebSocket connected)');
 
+  // USDC.e balance at start (for ROI: wallet value change + redeemable)
+  let startUsdcBalance: number | null = null;
+  if (!DRY_RUN) {
+    try {
+      const ctf = new CTFClient({ privateKey, rpcUrl: process.env.RPC_URL });
+      const bal = await ctf.getUsdcBalance();
+      startUsdcBalance = parseFloat(bal);
+      console.log(`  USDC.e balance at start: $${startUsdcBalance.toFixed(2)}`);
+    } catch (err) {
+      console.warn('  ⚠ Could not read USDC.e balance at start:', (err as Error).message);
+    }
+  }
+
   let tradeLog: Array<{
     time: string;
     trader: string;
@@ -128,7 +141,7 @@ async function main() {
     sizeScale: SIZE_SCALE,
     maxSizePerTrade: Infinity,
     maxSlippage: MAX_SLIPPAGE,
-    orderType: 'FOK',
+    orderType: 'FAK',
     minTradeSize: 0,
     minOrderSizeUsdc: MIN_TRADE_SIZE,
     maxPricePerShare: MAX_PRICE_PER_SHARE,
@@ -208,21 +221,42 @@ async function main() {
   console.log('Type "stop" or press Ctrl+C to shut down.\n');
 
   // Graceful shutdown
-  const shutdown = () => {
+  const shutdown = async () => {
     const stats = subscription.getStats();
     const runSec = Math.floor((Date.now() - stats.startTime) / 1000);
 
-    // Profit and unredeemed: use only executed (successful) trades, same as holdings
     const executedSuccess = tradeLog.filter(t => t.success);
     const buyExecuted = executedSuccess.filter(t => t.side === 'BUY');
     const sellExecuted = executedSuccess.filter(t => t.side === 'SELL');
     const totalBuySpent = buyExecuted.reduce((sum, t) => sum + t.copyValue, 0);
     const totalSellReceived = sellExecuted.reduce((sum, t) => sum + t.copyValue, 0);
-    const netPnl = totalSellReceived - totalBuySpent;
 
     const openPositions = Array.from(holdings.entries()).filter(([, p]) => p.shares > 0);
     const unredeemedCount = openPositions.length;
     const valueAfterRedeemed = openPositions.reduce((sum, [, p]) => sum + p.shares, 0);
+
+    // ROI = (end USDC balance + value of redeemable positions) - start USDC balance (when start was recorded)
+    let roiUsdc: number | null = null;
+    let endUsdcBalance: number | null = null;
+    let redeemableValueUsdc = 0;
+    if (!DRY_RUN) {
+      try {
+        const walletAddress = sdk.tradingService.getAddress();
+        const ctf = new CTFClient({ privateKey, rpcUrl: process.env.RPC_URL });
+        const endBal = await ctf.getUsdcBalance();
+        endUsdcBalance = parseFloat(endBal);
+        const redeemablePositions = await sdk.dataApi.getPositions(walletAddress, { redeemable: true });
+        redeemableValueUsdc = redeemablePositions.reduce(
+          (sum, p) => sum + (p.currentValue ?? p.size),
+          0
+        );
+        if (startUsdcBalance !== null) {
+          roiUsdc = endUsdcBalance + redeemableValueUsdc - startUsdcBalance;
+        }
+      } catch (err) {
+        console.error('  Could not compute ROI (balance/redeemable):', (err as Error).message);
+      }
+    }
 
     const lines: string[] = [
       '',
@@ -237,15 +271,36 @@ async function main() {
       `  Trades skipped:   ${stats.tradesSkipped}`,
       `  Trades failed:    ${stats.tradesFailed}`,
       '',
-      '  --- Profit (executed trades only) ---',
+      '  --- Executed trades ---',
       `  BUY executed:     ${buyExecuted.length} ($${totalBuySpent.toFixed(2)} spent)`,
       `  SELL executed:    ${sellExecuted.length} ($${totalSellReceived.toFixed(2)} received)`,
-      `  Net P&L:          ${netPnl >= 0 ? '+' : ''}$${netPnl.toFixed(2)}`,
-      '',
-      '  --- Unredeemed (executed BUYs not yet sold) ---',
-      `  Positions open:   ${unredeemedCount} (waiting to be sold/redeemed)`,
-      `  Value after redeemed: $${valueAfterRedeemed.toFixed(2)}`,
     ];
+
+    if (endUsdcBalance !== null) {
+      lines.push(
+        '',
+        '  --- ROI (wallet USDC + redeemable value) ---',
+        ...(startUsdcBalance !== null
+          ? [
+              `  USDC.e at start:  $${startUsdcBalance.toFixed(2)}`,
+              `  USDC.e at end:    $${endUsdcBalance.toFixed(2)}`,
+              `  Redeemable value: $${redeemableValueUsdc.toFixed(2)} (positions ready to redeem)`,
+              `  ROI:              ${roiUsdc! >= 0 ? '+' : ''}$${roiUsdc!.toFixed(2)}`,
+            ]
+          : [
+              `  USDC.e at end:    $${endUsdcBalance.toFixed(2)}`,
+              `  Redeemable value: $${redeemableValueUsdc.toFixed(2)} (positions ready to redeem)`,
+              `  ROI:              N/A (start balance unavailable — set RPC_URL if needed)`,
+            ]),
+      );
+    }
+
+    lines.push(
+      '',
+      '  --- Open positions (not yet sold/redeemed) ---',
+      `  Positions open:   ${unredeemedCount} (waiting to be sold/redeemed)`,
+      `  Value if redeemed: $${valueAfterRedeemed.toFixed(2)}`,
+    );
 
     if (executedSuccess.length > 0) {
       lines.push('', '📋 Trade Log (executed only):');

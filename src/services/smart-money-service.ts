@@ -18,8 +18,8 @@
  * ## 下单方式
  * | 方式 | 使用场景 | 特点 |
  * |------|---------|------|
- * | FOK | 小额跟单 | 全部成交或取消 |
- * | FAK | 大额跟单 | 部分成交也接受 |
+ * | FOK | 全部成交或取消（易触发重试） |
+ * | FAK | 默认：部分成交也接受，减少重试与延迟 |
  *
  * ## 轮询配置
  * - 默认间隔：5秒
@@ -1142,7 +1142,7 @@ export class SmartMoneyService {
    *   sizeScale: 0.1,        // 10%
    *   maxSizePerTrade: 50,   // $50
    *   maxSlippage: 0.03,     // 3%
-   *   orderType: 'FOK',
+   *   orderType: 'FAK',      // default: partial fill OK, then retry at market price if needed
    *
    *   dryRun: true,          // 测试模式
    *
@@ -1204,7 +1204,7 @@ export class SmartMoneyService {
     const sizeScale = options.sizeScale ?? 0.1;
     const maxSizePerTrade = options.maxSizePerTrade ?? 50;
     const maxSlippage = options.maxSlippage ?? 0.03;
-    const orderType = options.orderType ?? 'FOK';
+    const orderType = options.orderType ?? 'FAK';
     const minTradeSize = options.minTradeSize ?? 10;
     const minOrderSizeUsdc = options.minOrderSizeUsdc ?? 1;
     const sideFilter = options.sideFilter;
@@ -1316,47 +1316,20 @@ export class SmartMoneyService {
               orderType,
             });
 
-            // Retry as FAK if FOK failed due to "couldn't be fully filled" (SELL or BUY)
-            const err = (result.errorMsg ?? '').trim();
-            const errLower = err.toLowerCase();
-            const isFokNotFilledMsg =
-              errLower.includes('fully filled') && (errLower.includes('fok') || errLower.includes('killed')) ||
-              errLower.includes("couldn't be fully filled") ||
-              errLower.includes('could not be fully filled') ||
-              errLower.includes('fully filled or killed');
-            const isFokNotFilled =
-              !result.success &&
-              orderType === 'FOK' &&
-              isFokNotFilledMsg;
-            if (!result.success && orderType === 'FOK' && !isFokNotFilledMsg && err.length > 0) {
-              console.log('[SmartMoney] FOK order failed but retry not triggered. Error (first 120 chars):', err.slice(0, 120));
-            }
-            if (isFokNotFilled && this.tradingService) {
+            // If initial order failed, retry once at market (aggressive) price with FAK
+            if (!result.success && this.tradingService) {
               const sideLabel = trade.side === 'SELL' ? 'SELL' : 'BUY';
-              console.log(`[SmartMoney] ${sideLabel} FOK failed (not fully filled), retrying as FAK...`);
-              let retryResult = await this.tradingService.createMarketOrder({
+              const marketPrice = trade.side === 'SELL' ? 0.01 : 0.99;
+              console.log(`[SmartMoney] ${sideLabel} at slippage price failed, retrying at market price (${marketPrice})...`);
+              const marketResult = await this.tradingService.createMarketOrder({
                 tokenId,
                 side: trade.side,
                 amount: usdcAmount,
-                price: slippagePrice,
+                price: marketPrice,
                 orderType: 'FAK',
               });
-              if (retryResult.success) {
-                result = retryResult;
-              } else {
-                // FAK at same price failed; try at market (aggressive) price
-                const marketPrice = trade.side === 'SELL' ? 0.01 : 0.99;
-                console.log(`[SmartMoney] ${sideLabel} FAK retry failed, trying at market price (${marketPrice})...`);
-                const marketResult = await this.tradingService.createMarketOrder({
-                  tokenId,
-                  side: trade.side,
-                  amount: usdcAmount,
-                  price: marketPrice,
-                  orderType: 'FAK',
-                });
-                if (marketResult.success) {
-                  result = marketResult;
-                }
+              if (marketResult.success) {
+                result = marketResult;
               }
             }
           }
